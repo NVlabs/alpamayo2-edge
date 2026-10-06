@@ -138,6 +138,22 @@ together, resize `uint8` pixels before normalization, and preserve relative-time
 labels and component newlines. Replacing these operations with a generic VLM
 prompt changes checkpoint behavior.
 
+Keep the saved `chat_template.jinja` unchanged and use the Edge conversation
+recipe: images, trajectory history, navigation instruction, then task text;
+the task requests reasoning followed by a future trajectory. The navigation
+prefix is `Navigation input is: `, the task prefix is `Your task: `, and logical
+components are separated by newlines. This plain-text recipe does not prefill
+`<|cot_start|>` or use route wrapper tokens.
+
+Relative timestamps use the last capture **after camera-major sorting** as their
+zero point: the latest camera-6 frame in this input profile. Preserve this
+convention even when another camera's latest capture or `event_t0_us` is later.
+Subtract timestamps in `int64` microseconds, then convert the difference to
+seconds and format one decimal place, normalizing negative zero to `0.0`.
+Place each `<t=...s>` label immediately before its corresponding image. The
+[source and input-boundary audit](validation.md#chat-template-and-timestamp-audit)
+found no required template or timestamp config change for this checkpoint.
+
 For a bundle release, retain `manifest.json`, `samples_manifest.json`, ten
 `samples/sample_NNN/{sample.json,tensors.safetensors}` directories, and the
 corresponding `reference/` artifacts. Ground-truth trajectories are separate

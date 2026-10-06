@@ -164,9 +164,7 @@ from alpamayo2_edge.sample import load_sample
 
 model, loading_info = load_model("/path/to/bundle/model", device="cuda")
 sample = load_sample("/path/to/sample_000")
-inputs = to_device(
-    prepare_model_inputs(sample, model.config, model.tokenizer), device="cuda"
-)
+inputs = to_device(prepare_model_inputs(sample, model.config, model.tokenizer), device="cuda")
 torch.manual_seed(43)
 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
     xyz, rotations, _, extra = model.sample_trajectories_from_data(
