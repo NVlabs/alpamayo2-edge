@@ -137,12 +137,59 @@ in each output root's `report.json`; each example also saves packed inputs and
 output tensors. Reproducing these commands verifies execution and shape/finite
 checks. Reference comparison is a separate operation on those saved artifacts.
 
+## Public PhysicalAI-AV navigation example
+
+On 2026-10-07, the CLI also ran end to end from the public PhysicalAI-AV SDK on
+the [released Super navigation demo](https://github.com/NVlabs/alpamayo2/blob/59776920bbd981f2c989213bba5ee8594e71ed1d/examples/two_gpu_nav_cfg_demo.py).
+The checked-in `examples/nav_samples.json` combines that demo's published clip
+and time with its supplied navigation instruction:
+
+| Field | Tested value |
+| --- | --- |
+| Dataset | `nvidia/PhysicalAI-Autonomous-Vehicles` |
+| Dataset revision | `33f9bf447ed3bcb7d545ce13f4226f824214fafb` |
+| Clip | `ea7bbd31-b7a5-4972-8dbd-7089e6b53de4` |
+| Clip-relative anchor | 4,000,000 microseconds |
+| Navigation | `Turn right in 30m` |
+| Input profile | 22 actual camera images, 20 historical ego poses |
+| Runtime | H100 80GB, BF16, PyTorch 2.8.0+cu128, Transformers 5.17.0, SDPA |
+| Dataset dependencies | physical-ai-av 0.2.0, av 19.0.1, pandas 3.0.6, pyarrow 25.0.1 |
+
+The final run used the dataset dependencies resolved in `uv.lock`. All six
+reasoning/trajectory sets completed with finite XYZ and rotations, shaped
+`[1, 6, 1, 64, 3]` and `[1, 6, 1, 64, 3, 3]`. Checkpoint loading reported no
+missing, unexpected, or mismatched parameters. The saved fused prompt contains
+all 22 relative timestamp labels and the selected navigation instruction.
+No future trajectory was loaded as an input. This is an execution check of one
+published navigation example, not a navigation-quality metric or a comparison
+with Super's classifier-free guidance outputs.
+
+Follow the [public clip setup instructions](../README.md#run-a-physicalai-av-navigation-example),
+then reproduce with the same local checkpoint used above:
+
+```bash
+python -m alpamayo2_edge.inference \
+    --model-id "$EDGE_BUNDLE/model" \
+    --manifest examples/nav_samples.json \
+    --num-traj-sets 6 --num-traj-samples 1 \
+    --attn-implementation sdpa --output outputs/physicalai-nav
+```
+
+Local evidence is saved under `.work/results-physicalai-nav-sdpa/`, including
+`report.json`, the actual packed model inputs, fused prompt, and outputs. The
+report records the dataset revision and decoder dependency versions. Dataset
+revisions can be selected through a supplied `PhysicalAIAVDatasetInterface` in
+the Python API; the CLI resolves the SDK's default dataset revision at run time.
+
 ## CPU tests
 
-The full suite passed **52 tests**, including the optional real-bundle input
+The full suite passed **78 tests**, including the optional real-bundle input
 comparison and timestamp perturbation test. Tests cover noncausal expert
 attention, cache reuse, CoT/sample counts, anchor completion, left padding,
-HF save/load, input validation, and CLI reports.
+HF save/load, input validation, and CLI reports. Public dataset tests additionally
+cover per-camera sampling, timestamp jitter and image association, full rigid
+pose transforms, inclusive time bounds, missing optional dependencies, and
+manifest navigation selection/overrides.
 Ruff checks, formatting, lockfile validation, and source/wheel builds also passed.
 
 Run `CUDA_VISIBLE_DEVICES="" uv run --locked pytest` for the CPU suite. The saved

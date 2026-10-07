@@ -8,11 +8,12 @@ trajectory diffusion expert. Given six-camera observations, ego history, and a
 navigation instruction, the model generates driving reasoning and 64 future poses
 at 0.1-second intervals.
 
-This is a **pre-release implementation**. The example below uses the private
+This is a **pre-release implementation**. Inference uses the private
 [Internal-Alpamayo2-Edge checkpoint bundle](https://huggingface.co/nvidia/Internal-Alpamayo2-Edge/tree/7db095f3f1c54e2236f96e1baf12c2bc3c5ee9e4/2b/1002_model1_v3_plain_vqa1000_step6530),
 which requires authorized Hugging Face access. A public model URL has not been
-selected. This implementation currently supports the Qwen3-VL checkpoint and its
-22-image, 20-pose input profile.
+selected. You can load example clips directly from PhysicalAI-AV or use the
+checkpoint bundle's raw samples. This implementation currently supports the
+Qwen3-VL checkpoint and its 22-image, 20-pose input profile.
 
 ## Setup
 
@@ -30,6 +31,62 @@ with compatible CUDA build prerequisites. To select it after installation, pass
 `--attn-implementation flash_attention_2`. The bundle's saved references were
 produced with FA2, BF16, and an H100; a different backend or runtime can change
 sampled text and trajectories.
+
+## Run a PhysicalAI-AV navigation example
+
+This path follows the [Alpamayo 2 Super navigation example](https://github.com/NVlabs/alpamayo2/blob/59776920bbd981f2c989213bba5ee8594e71ed1d/examples/two_gpu_nav_cfg_demo.py):
+load a clip through the public dataset SDK, prepare the Edge input profile, and
+run the model. Install the optional dataset dependency and authenticate with a
+Hugging Face account that has access to both the checkpoint and
+[PhysicalAI-Autonomous-Vehicles](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles).
+The dataset requires accepting its access terms on Hugging Face.
+
+```bash
+uv sync --locked --extra dataset --dev
+source .venv/bin/activate
+hf auth login
+
+python -m alpamayo2_edge.inference \
+    --model-id nvidia/Internal-Alpamayo2-Edge \
+    --subfolder 2b/1002_model1_v3_plain_vqa1000_step6530/model \
+    --revision 7db095f3f1c54e2236f96e1baf12c2bc3c5ee9e4 \
+    --manifest examples/nav_samples.json \
+    --output outputs/physicalai-nav
+```
+
+This downloads model assets without requiring the private bundle's sample files.
+[examples/nav_samples.json](examples/nav_samples.json) pairs the published Super
+demo clip `ea7bbd31-b7a5-4972-8dbd-7089e6b53de4` at **4.0 seconds** with its demo
+instruction **`Turn right in 30m`**. Super stores the clip/time in its navigation
+manifest and the instruction in its demo script; this manifest records both and
+their source commit. The navigation is a supplied instruction, not a route label
+read from the public dataset. This runs Edge's ordinary navigation-conditioned
+inference; Super's two-GPU classifier-free guidance implementation is separate.
+
+For a local checkpoint and an explicitly selected clip:
+
+```bash
+python -m alpamayo2_edge.inference \
+    --model-id /path/to/bundle/model \
+    --clip-id ea7bbd31-b7a5-4972-8dbd-7089e6b53de4 \
+    --t0-us 4000000 \
+    --nav-text "Turn right in 30m" \
+    --output outputs/physicalai-nav
+```
+
+`--manifest` selects index 0 by default; use `--sample-index` for other entries.
+Each entry supplies `clip_id`, `t0_us`, and `nav_text`. You can also pass Super's
+clip/time-only manifests with an explicit `--nav-text`. An explicit navigation
+argument overrides the selected entry. Direct `--clip-id` input always requires
+`--nav-text`; `--t0-us` defaults to 5,100,000 microseconds when omitted.
+
+The loader reads six cameras using the 22-frame schedule below and 20 historical
+ego poses in the ego frame at `t0`. It retains actual decoded image timestamps in
+clip-relative microseconds and does not query future poses. The existing Edge
+processor then builds the prompt and model inputs. Hugging Face access and
+streaming are handled by `physical-ai-av`; `HF_HUB_CACHE` can select its cache
+location. `--local-files-only` controls model loading only. Output records include
+the clip, time, navigation text, and resolved dataset revision.
 
 ## Download the checkpoint and examples
 
@@ -179,6 +236,23 @@ with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         return_extra=True,
     )
 ```
+
+To source the same raw input dictionary from a public clip, replace `load_sample`
+with:
+
+```python
+from alpamayo2_edge.load_physical_aiavdataset import load_physical_aiavdataset
+
+sample = load_physical_aiavdataset(
+    "ea7bbd31-b7a5-4972-8dbd-7089e6b53de4",
+    t0_us=4_000_000,
+    nav_text="Turn right in 30m",
+)
+```
+
+The subsequent `prepare_model_inputs` and model calls stay the same. An optional
+`avdi` argument accepts an existing `PhysicalAIAVDatasetInterface`, allowing a
+chosen dataset revision/cache to be reused across multiple clips.
 
 `load_model` rejects missing, unexpected, or mismatched checkpoint parameters.
 The third model return value is a placeholder log probability and should not be

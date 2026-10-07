@@ -70,3 +70,60 @@ def test_report_records_selected_cuda_device(tmp_path, monkeypatch):
         ]
     )
     assert json.loads((tmp_path / "report.json").read_text())["device"] == "GPU at cuda:1"
+
+
+def test_clip_manifest_uses_paired_navigation_and_explicit_override(tmp_path):
+    import json
+
+    from alpamayo2_edge.inference import load_clip_manifest
+
+    path = tmp_path / "samples.json"
+    path.write_text(
+        json.dumps(
+            {
+                "samples": [
+                    {
+                        "clip_id": "ea7bbd31-b7a5-4972-8dbd-7089e6b53de4",
+                        "t0_us": 4000000,
+                        "nav_text": "Turn right in 30m",
+                    },
+                    {"clip_id": "030c760c-ae38-49aa-9ad8-f5650a545d26", "t0_us": 5100000},
+                ]
+            }
+        )
+    )
+    assert load_clip_manifest(path, 0) == {
+        "clip_id": "ea7bbd31-b7a5-4972-8dbd-7089e6b53de4",
+        "t0_us": 4000000,
+        "nav_text": "Turn right in 30m",
+    }
+    # Super's manifest stores clip/time only; its demo supplies navigation separately.
+    assert (
+        load_clip_manifest(path, 1, nav_text="Continue straight")["nav_text"] == "Continue straight"
+    )
+    with pytest.raises(ValueError, match="nav"):
+        load_clip_manifest(path, 1)
+    with pytest.raises(ValueError, match="index"):
+        load_clip_manifest(path, -1)
+    with pytest.raises(ValueError, match="index"):
+        load_clip_manifest(path, 2)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("clip_id", "../bad"), ("t0_us", 1.2), ("t0_us", True), ("nav_text", " ")]
+)
+def test_clip_manifest_rejects_invalid_inputs_before_download(tmp_path, field, value):
+    import json
+
+    from alpamayo2_edge.inference import load_clip_manifest
+
+    sample = {
+        "clip_id": "ea7bbd31-b7a5-4972-8dbd-7089e6b53de4",
+        "t0_us": 4000000,
+        "nav_text": "Turn right in 30m",
+        field: value,
+    }
+    path = tmp_path / "samples.json"
+    path.write_text(json.dumps({"samples": [sample]}))
+    with pytest.raises(ValueError, match=field):
+        load_clip_manifest(path, 0)
