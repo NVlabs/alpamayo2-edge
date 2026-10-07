@@ -196,8 +196,12 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--attn-implementation", choices=["sdpa", "flash_attention_2"], default="sdpa"
     )
-    parser.add_argument("--num-traj-sets", type=int)
-    parser.add_argument("--num-traj-samples", type=int)
+    parser.add_argument("--num-traj-sets", type=int, help="Number of trajectory output groups")
+    parser.add_argument(
+        "--num-traj-samples",
+        type=int,
+        help="Trajectories per group; each has an independently sampled reasoning continuation",
+    )
     parser.add_argument("--max-generation-length", type=int)
     parser.add_argument("--diffusion-steps", type=int)
     parser.add_argument("--seed", type=int)

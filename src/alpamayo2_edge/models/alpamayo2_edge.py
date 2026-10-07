@@ -10,8 +10,9 @@ import hydra.utils as hyu
 import numpy as np
 import torch
 import transformers
-from transformers import AutoModel, PreTrainedModel, StoppingCriteriaList
+from transformers import AutoModel, GenerationConfig, PreTrainedModel, StoppingCriteriaList
 from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
+from transformers.generation.utils import GenerateDecoderOnlyOutput
 
 from alpamayo2_edge.config import (
     Alpamayo2EdgeConfig,
@@ -58,8 +59,8 @@ class Alpamayo2Edge(PreTrainedModel):
     """Qwen3-VL reasoning followed by ten-step trajectory flow matching.
 
     The VLM and expert retain their checkpoint module names and KV geometry.
-    ``num_traj_sets`` samples independent CoTs; ``num_traj_samples`` samples
-    independent diffusion trajectories from each completed CoT's cache.
+    Every trajectory samples its own CoT from a shared prompt prefill.
+    ``num_traj_sets`` and ``num_traj_samples`` group these independent candidates.
     """
 
     config_class = Alpamayo2EdgeConfig
@@ -111,6 +112,54 @@ class Alpamayo2Edge(PreTrainedModel):
     def tie_weights(self, *args: Any, **kwargs: Any) -> None:
         super().tie_weights(*args, **kwargs)
 
+    def _generate_with_shared_prefill(
+        self,
+        tokenized_data: dict[str, Any],
+        generation_config: GenerationConfig,
+        n_samples_total: int,
+        **generate_kwargs: Any,
+    ) -> GenerateDecoderOnlyOutput:
+        """Prefill each prompt once and sample independent CoTs from its cache."""
+        generation_config.num_return_sequences = 1
+        generation_config.output_logits = False
+        input_ids = tokenized_data["input_ids"]
+        prompt_mask = tokenized_data["attention_mask"]
+        vision_keys = ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw")
+        prefill_inputs = {key: tokenized_data[key] for key in vision_keys if key in tokenized_data}
+        if "mm_token_type_ids" in tokenized_data:
+            prefill_inputs["mm_token_type_ids"] = tokenized_data["mm_token_type_ids"][:, :-1]
+        if all(tokenized_data.get(key) is None for key in ("image_grid_thw", "video_grid_thw")):
+            # Direct HF5 text forwards do not initialize RoPE deltas or remove
+            # left padding from positions as generate() does.
+            text_positions = prompt_mask.long().cumsum(-1) - 1
+            prefill_inputs["position_ids"] = text_positions.masked_fill(prompt_mask == 0, 0)[:, :-1]
+            self.vlm.model.rope_deltas = input_ids.new_zeros((input_ids.shape[0], 1))
+        # The final prompt token supplies the first generation logits. All image
+        # tokens precede it, so vision encoding runs only at the original batch size.
+        prefill_outputs = self.vlm.model(
+            input_ids=input_ids[:, :-1],
+            attention_mask=prompt_mask[:, :-1],
+            use_cache=True,
+            **prefill_inputs,
+        )
+        prompt_cache = prefill_outputs.past_key_values
+        del prefill_outputs
+        prompt_cache.batch_repeat_interleave(n_samples_total)
+        rope_deltas = self.vlm.model.rope_deltas
+        if rope_deltas is None:
+            raise RuntimeError("The VLM did not produce multimodal rotary position offsets.")
+        rope_deltas = rope_deltas.repeat_interleave(n_samples_total, dim=0)
+        self.vlm.model.rope_deltas = rope_deltas
+        outputs = self.vlm.generate(
+            input_ids=input_ids.repeat_interleave(n_samples_total, dim=0),
+            attention_mask=prompt_mask.repeat_interleave(n_samples_total, dim=0),
+            past_key_values=prompt_cache,
+            generation_config=generation_config,
+            **generate_kwargs,
+        )
+        outputs.rope_deltas = rope_deltas
+        return outputs
+
     @torch.inference_mode()
     def sample_trajectories_from_data(
         self,
@@ -126,8 +175,9 @@ class Alpamayo2Edge(PreTrainedModel):
     ) -> tuple:
         """Return XYZ, rotations and placeholder log probabilities.
 
-        Trajectory dimensions are ``[batch, CoTs, samples_per_CoT, waypoints, ...]``.
-        When requested, decoded text uses the same first three dimensions.
+        Trajectory dimensions are ``[batch, sets, samples, waypoints, ...]``.
+        Each candidate has an independent CoT. Decoded text uses the same first
+        three dimensions; generated token IDs flatten those dimensions.
         A missing ``<|traj_future_start|>`` raises before running the expert.
         """
         if not self.config.enable_expert:
@@ -161,6 +211,7 @@ class Alpamayo2Edge(PreTrainedModel):
             token_types[input_ids == self.config.vlm_config.video_token_id] = 2
             tokenized_data["mm_token_type_ids"] = token_types
         batch_size, prompt_length = input_ids.shape
+        n_samples_total = num_traj_sets * num_traj_samples
         anchor = self.config.traj_ids["future_start"]
         generation_config = copy.deepcopy(self.vlm.generation_config)
         generation_config.top_p = top_p
@@ -168,7 +219,6 @@ class Alpamayo2Edge(PreTrainedModel):
         generation_config.temperature = temperature
         generation_config.do_sample = True
         generation_config.num_beams = 1
-        generation_config.num_return_sequences = num_traj_sets
         generation_config.max_new_tokens = max_generation_length or max(
             256, self.config.tokens_per_future_traj
         )
@@ -194,9 +244,10 @@ class Alpamayo2Edge(PreTrainedModel):
         blocked_eos = [token_id for token_id in eos_ids if token_id != anchor]
         if blocked_eos:
             processors.append(MaskTokenIdsLogitsProcessor(blocked_eos))
-        vlm_outputs = self.vlm.generate(
-            **tokenized_data,
+        vlm_outputs = self._generate_with_shared_prefill(
+            tokenized_data,
             generation_config=generation_config,
+            n_samples_total=n_samples_total,
             logits_processor=processors,
             stopping_criteria=StoppingCriteriaList([StopAfterEOS(anchor)]),
         )
@@ -208,13 +259,9 @@ class Alpamayo2Edge(PreTrainedModel):
         cache = vlm_outputs.past_key_values
         if cache is None:
             raise RuntimeError("The VLM did not return the KV cache needed by the expert.")
-        rope_deltas = self.vlm.model.rope_deltas
-        cot_batch = batch_size * num_traj_sets
-        if rope_deltas is None:
-            raise RuntimeError("The VLM did not produce multimodal rotary position offsets.")
-        if rope_deltas.shape[0] != cot_batch:
-            rope_deltas = rope_deltas.repeat_interleave(num_traj_sets, dim=0)
-        prefix_mask = tokenized_data["attention_mask"].repeat_interleave(num_traj_sets, dim=0)
+        rope_deltas = vlm_outputs.rope_deltas
+        expert_batch = batch_size * n_samples_total
+        prefix_mask = tokenized_data["attention_mask"].repeat_interleave(n_samples_total, dim=0)
         # HF5 expresses MRoPE deltas relative to unpadded text positions. Cache
         # offsets include prompt padding, so remove it for both continuation and
         # expert rotary positions (without changing the cache-column masks).
@@ -226,12 +273,12 @@ class Alpamayo2Edge(PreTrainedModel):
             # forwarded it. Finish only the uncached text, reusing the vision cache.
             missing_ids = sequences[:, cached_length:prefix_length]
             text_positions = torch.arange(cached_length, prefix_length, device=input_ids.device)
-            positions = text_positions[None, None, :].expand(3, cot_batch, -1)
+            positions = text_positions[None, None, :].expand(3, expert_batch, -1)
             positions = positions + rope_deltas[None, :, :]
             completed_mask = torch.cat(
                 [
                     prefix_mask,
-                    prefix_mask.new_ones((cot_batch, prefix_length - prompt_length)),
+                    prefix_mask.new_ones((expert_batch, prefix_length - prompt_length)),
                 ],
                 dim=1,
             )
@@ -247,12 +294,6 @@ class Alpamayo2Edge(PreTrainedModel):
         sequences[:, prompt_length:] = replace_padding_after_eos(
             sequences[:, prompt_length:], anchor, self.tokenizer.pad_token_id
         )
-        if num_traj_samples > 1:
-            cache.batch_repeat_interleave(num_traj_samples)
-        offsets = offsets.repeat_interleave(num_traj_samples)
-        rope_deltas = rope_deltas.repeat_interleave(num_traj_samples, dim=0)
-        prefix_mask = prefix_mask.repeat_interleave(num_traj_samples, dim=0)
-        expert_batch = cot_batch * num_traj_samples
         action_dims = self.expert.action_space.get_action_space_dims()
         position_ids, attention_mask = build_expert_pos_ids_and_attn_mask(
             offset=offsets,
@@ -293,11 +334,10 @@ class Alpamayo2Edge(PreTrainedModel):
             return_all_steps=False,
             **(diffusion_kwargs or {}),
         )
-        repeats = num_traj_sets * num_traj_samples
         pred_xyz, pred_rot = self.expert.action_space.action_to_traj(
             sampled_action,
-            traj_data["ego_history_xyz"][:, -1].repeat_interleave(repeats, dim=0),
-            traj_data["ego_history_rot"][:, -1].repeat_interleave(repeats, dim=0),
+            traj_data["ego_history_xyz"][:, -1].repeat_interleave(n_samples_total, dim=0),
+            traj_data["ego_history_rot"][:, -1].repeat_interleave(n_samples_total, dim=0),
         )
         shape = (batch_size, num_traj_sets, num_traj_samples)
         pred_xyz = pred_xyz.reshape(*shape, *pred_xyz.shape[1:])
@@ -306,14 +346,9 @@ class Alpamayo2Edge(PreTrainedModel):
         if not return_extra:
             return pred_xyz, pred_rot, logprob
         decoded = extract_text_tokens(self.tokenizer, sequences)
-        extra = {
-            key: np.repeat(
-                np.asarray(value).reshape(batch_size, num_traj_sets, 1), num_traj_samples, axis=2
-            )
-            for key, value in decoded.items()
-        }
+        extra = {key: np.asarray(value).reshape(shape) for key, value in decoded.items()}
         generated_ids = vlm_outputs.sequences[:, prompt_length:].clone()
-        generated_offsets = offsets[::num_traj_samples] - prompt_length
+        generated_offsets = offsets - prompt_length
         columns = torch.arange(generated_ids.shape[1], device=generated_ids.device)
         generated_ids.masked_fill_(columns[None, :] >= generated_offsets[:, None], -1)
         extra["generated_ids"] = generated_ids

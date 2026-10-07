@@ -71,16 +71,33 @@ def _sampling_model(monkeypatch, *, include_anchor=True, cache_length=5):
     generations = []
     pending_tokens = []
 
+    class Backbone:
+        rope_deltas = torch.tensor([[-1]])
+
+        def __init__(self):
+            self.prefill_inputs = []
+            self.language_model = finish_cache
+
+        def __call__(self, **kwargs):
+            self.prefill_inputs.append(kwargs)
+            cache.length = kwargs["input_ids"].shape[-1]
+            return SimpleNamespace(past_key_values=cache)
+
     class VLM:
         generation_config = GenerationConfig(eos_token_id=2)
-        model = SimpleNamespace(rope_deltas=torch.tensor([[-1], [-2]]))
 
         def generate(self, input_ids, generation_config, **kwargs):
             generations.append(generation_config)
             anchor = 9 if include_anchor else 8
-            generated = torch.tensor([[3, anchor, 7, 7], [4, 5, anchor, 7]])
+            generated = torch.tensor(
+                [
+                    [20 + row, anchor, 7, 7] if row % 2 == 0 else [20 + row, 5, anchor, 7]
+                    for row in range(input_ids.shape[0])
+                ]
+            )
+            cache.length = cache_length
             return SimpleNamespace(
-                sequences=torch.cat([input_ids.repeat_interleave(2, dim=0), generated], dim=1),
+                sequences=torch.cat([input_ids, generated], dim=1),
                 past_key_values=cache,
             )
 
@@ -90,7 +107,7 @@ def _sampling_model(monkeypatch, *, include_anchor=True, cache_length=5):
         return SimpleNamespace(past_key_values=cache)
 
     vlm = VLM()
-    vlm.model = SimpleNamespace(rope_deltas=VLM.model.rope_deltas, language_model=finish_cache)
+    vlm.model = Backbone()
 
     def denoiser(**kwargs):
         calls.append(kwargs)
@@ -135,7 +152,11 @@ def _sampling_model(monkeypatch, *, include_anchor=True, cache_length=5):
 
     model.expert.expert = Denoiser()
     monkeypatch.setattr(module, "fuse_traj_tokens", lambda a, b, ids, data, config: ids)
-    monkeypatch.setattr(module, "extract_text_tokens", lambda tokenizer, ids: {"cot": ["A", "B"]})
+    monkeypatch.setattr(
+        module,
+        "extract_text_tokens",
+        lambda tokenizer, ids: {"cot": [f"CoT_{int(row[2]) - 20}" for row in ids]},
+    )
     data = {
         "tokenized_data": {
             "input_ids": torch.tensor([[1, 6]]),
@@ -147,25 +168,34 @@ def _sampling_model(monkeypatch, *, include_anchor=True, cache_length=5):
     return model, data, cache, calls, generations, pending_tokens
 
 
-def test_samples_share_cot_cache_and_crop_each_diffusion_step(monkeypatch):
+@pytest.mark.parametrize("num_sets,num_samples", [(1, 6), (2, 3), (6, 1)])
+def test_each_trajectory_has_its_own_cot_and_reuses_the_prompt_prefill(
+    monkeypatch, num_sets, num_samples
+):
     model, data, cache, calls, generations, pending = _sampling_model(monkeypatch)
     xyz, rot, logprob, extra = model.sample_trajectories_from_data(
-        data, num_traj_sets=2, num_traj_samples=3, return_extra=True
+        data, num_traj_sets=num_sets, num_traj_samples=num_samples, return_extra=True
     )
-    assert generations[0].num_return_sequences == 2
-    assert cache.repeat_factor == 3
+    assert generations[0].num_return_sequences == 1
+    assert cache.repeat_factor == 6
+    assert len(model.vlm.model.prefill_inputs) == 1
+    assert model.vlm.model.prefill_inputs[0]["input_ids"].shape[0] == 1
     assert len(calls) == 10
     assert cache.length == 5
     assert cache.crops[-10:] == [5] * 10
     assert calls[0]["inputs_embeds"].shape == (6, 4, 2)
     assert calls[0]["attention_mask"].shape == (6, 1, 4, 9)
     assert calls[0]["is_causal"] is False
-    assert xyz.shape == (1, 2, 3, 4, 3)
-    assert rot.shape == (1, 2, 3, 4, 3, 3)
-    assert logprob.shape == (1, 2, 3, 4)
-    assert extra["cot"].tolist() == [[["A", "A", "A"], ["B", "B", "B"]]]
+    assert xyz.shape == (1, num_sets, num_samples, 4, 3)
+    assert rot.shape == (1, num_sets, num_samples, 4, 3, 3)
+    assert logprob.shape == (1, num_sets, num_samples, 4)
+    assert extra["cot"].shape == (1, num_sets, num_samples)
+    assert extra["cot"].reshape(-1).tolist() == [f"CoT_{row}" for row in range(6)]
     torch.testing.assert_close(
-        extra["generated_ids"], torch.tensor([[3, 9, -1, -1], [4, 5, 9, -1]])
+        extra["generated_ids"],
+        torch.tensor(
+            [[20 + row, 9, -1, -1] if row % 2 == 0 else [20 + row, 5, 9, -1] for row in range(6)]
+        ),
     )
     assert not pending
 
@@ -197,12 +227,12 @@ def test_left_padding_is_removed_from_hf5_rotary_offsets(monkeypatch, cache_leng
     data["tokenized_data"]["input_ids"][0, 0] = 0
     data["tokenized_data"]["attention_mask"][0, 0] = 0
     model.sample_trajectories_from_data(data, num_traj_sets=2)
-    # Absolute anchor offsets [4, 5] + HF5 deltas [-1, -2] - one pad.
-    torch.testing.assert_close(calls[0]["position_ids"][0, :, 0], torch.tensor([2, 2]))
+    # Text-only prefill has zero MRoPE delta: [4, 5] anchor offsets - one pad.
+    torch.testing.assert_close(calls[0]["position_ids"][0, :, 0], torch.tensor([3, 4]))
     assert (calls[0]["attention_mask"][:, :, :, 0] < -1e20).all()
     if cache_length == 4:
         # The uncached token at column 4 follows the same padded-position rule.
-        torch.testing.assert_close(pending[0]["position_ids"][0, :, 0], torch.tensor([2, 1]))
+        torch.testing.assert_close(pending[0]["position_ids"][0, :, 0], torch.tensor([3, 3]))
 
 
 def test_an_anchor_in_the_prompt_does_not_hide_incomplete_generation(monkeypatch):
@@ -218,23 +248,17 @@ def test_an_anchor_in_the_prompt_does_not_hide_incomplete_generation(monkeypatch
 def test_legacy_packed_inputs_get_multimodal_position_types(monkeypatch):
     model, data, cache, calls, generations, pending = _sampling_model(monkeypatch)
     model.config.vlm_config = SimpleNamespace(image_token_id=6, video_token_id=8)
+    data["tokenized_data"]["input_ids"] = torch.tensor([[6, 1]])
     data["tokenized_data"]["pixel_values"] = torch.zeros(1, 4)
     data["tokenized_data"]["image_grid_thw"] = torch.ones(1, 3, dtype=torch.long)
-    generated_inputs = []
-    original_generate = model.vlm.generate
-
-    def capture_generate(**kwargs):
-        generated_inputs.append(kwargs)
-        return original_generate(**kwargs)
-
-    monkeypatch.setattr(model.vlm, "generate", capture_generate)
     model.sample_trajectories_from_data(data, num_traj_sets=2)
-    torch.testing.assert_close(generated_inputs[0]["mm_token_type_ids"], torch.tensor([[0, 1]]))
+    torch.testing.assert_close(
+        model.vlm.model.prefill_inputs[0]["mm_token_type_ids"], torch.tensor([[1]])
+    )
 
 
-@pytest.mark.parametrize("generation_limit", [1, 8])
-def test_real_qwen_generation_and_expert_integration_on_cpu(monkeypatch, generation_limit):
-    """Exercise HF generate/cache/position APIs using small real model layers."""
+def _tiny_model(monkeypatch):
+    """Build actual Qwen3-VL vision/text layers and an expert without external assets."""
     from transformers import Qwen3VLConfig
 
     import alpamayo2_edge.models.alpamayo2_edge as module
@@ -263,12 +287,19 @@ def test_real_qwen_generation_and_expert_integration_on_cpu(monkeypatch, generat
         vlm_name_or_path="test-tokenizer",
         vlm_config=Qwen3VLConfig(
             text_config=text_config,
+            image_token_id=10,
+            video_token_id=13,
+            vision_start_token_id=11,
+            vision_end_token_id=12,
             vision_config={
                 "depth": 1,
                 "hidden_size": 32,
                 "intermediate_size": 48,
                 "num_heads": 2,
                 "out_hidden_size": 64,
+                "patch_size": 2,
+                "temporal_patch_size": 2,
+                "spatial_merge_size": 2,
                 "deepstack_visual_indexes": [],
             },
         ),
@@ -294,7 +325,13 @@ def test_real_qwen_generation_and_expert_integration_on_cpu(monkeypatch, generat
         module, "build_alpamayo2_edge_tokenizer", lambda *args: SimpleNamespace(pad_token_id=0)
     )
     monkeypatch.setattr(module, "fuse_traj_tokens", lambda a, b, ids, data, config: ids)
-    model = module.Alpamayo2Edge(config).eval()
+    return module.Alpamayo2Edge(config).eval()
+
+
+@pytest.mark.parametrize("generation_limit", [1, 8])
+def test_real_qwen_generation_and_expert_integration_on_cpu(monkeypatch, generation_limit):
+    """Exercise HF generate/cache/position APIs using small real model layers."""
+    model = _tiny_model(monkeypatch)
 
     class AnchorHead(torch.nn.Module):
         def forward(self, hidden):
@@ -318,3 +355,77 @@ def test_real_qwen_generation_and_expert_integration_on_cpu(monkeypatch, generat
     assert torch.isfinite(predicted).all()
     assert torch.isfinite(rotations).all()
     assert (logprob == 0).all()
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+@torch.inference_mode()
+def test_shared_prefill_preserves_real_cache_positions_and_padding(monkeypatch, multimodal):
+    """Match stock generation's visible KV state, including padding and a previous request."""
+    from transformers import GenerationConfig
+
+    model = _tiny_model(monkeypatch)
+    if multimodal:
+        input_ids = torch.tensor(
+            [[0, 0, 1, 11, 10, 10, 10, 10, 12, 6], [1, 3, 4, 11, 10, 10, 10, 10, 12, 6]]
+        )
+    else:
+        input_ids = torch.tensor(
+            [[0, 0, 1, 3, 4, 5, 6, 7, 8, 6], [1, 3, 4, 5, 6, 7, 8, 9, 3, 6]]
+        )
+    tokenized = {
+        "input_ids": input_ids,
+        "attention_mask": input_ids.ne(0).long(),
+    }
+    if multimodal:
+        tokenized.update(
+            mm_token_type_ids=input_ids.eq(10).long(),
+            image_grid_thw=torch.tensor([[1, 4, 4], [1, 4, 4]]),
+            pixel_values=torch.randn(32, 24),
+        )
+    generation_config = GenerationConfig(
+        do_sample=False,
+        max_new_tokens=1,
+        return_dict_in_generate=True,
+        use_cache=True,
+        pad_token_id=0,
+        eos_token_id=None,
+    )
+    expected = model.vlm.generate(**tokenized, generation_config=generation_config)
+    expected_deltas = model.vlm.model.rope_deltas.clone()
+    # A previous image-bearing request may leave deltas from a different batch size.
+    model.vlm.model.rope_deltas = torch.full((7, 1), 13, dtype=torch.long)
+    vision_patch_counts = []
+
+    def record_vision(_module, args, kwargs, _output):
+        patches = args[0] if args else kwargs["hidden_states"]
+        vision_patch_counts.append(patches.shape[0])
+
+    hook = model.vlm.model.visual.register_forward_hook(record_vision, with_kwargs=True)
+    try:
+        generated = model._generate_with_shared_prefill(
+            tokenized,
+            generation_config,
+            n_samples_total=3,
+        )
+    finally:
+        hook.remove()
+
+    assert vision_patch_counts == ([32] if multimodal else [])
+    assert generated.sequences.shape == (6, 11)
+    torch.testing.assert_close(
+        generated.sequences[:, -1], expected.sequences[:, -1].repeat_interleave(3)
+    )
+    torch.testing.assert_close(generated.rope_deltas, expected_deltas.repeat_interleave(3, dim=0))
+    assert generated.past_key_values.get_seq_length() == input_ids.shape[1]
+    for reference, actual in zip(
+        expected.past_key_values.layers, generated.past_key_values.layers, strict=True
+    ):
+        # Left padding has no semantic KV content; compare only visible prompt positions.
+        visible = tokenized["attention_mask"].repeat_interleave(3, dim=0).bool()
+        for field in ("keys", "values"):
+            reference_states = getattr(reference, field).repeat_interleave(3, dim=0)
+            actual_states = getattr(actual, field)
+            mask = visible[:, None, :, None].expand_as(reference_states)
+            torch.testing.assert_close(
+                actual_states[mask], reference_states[mask], rtol=1e-4, atol=1e-5
+            )

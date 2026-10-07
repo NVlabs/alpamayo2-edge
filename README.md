@@ -127,18 +127,20 @@ python -m alpamayo2_edge.inference \
 
 Model-ID inference defaults to seed 43, one reasoning continuation and one
 trajectory, temperature 0.6, top-p 0.98, no top-k limit, at most 256 generated
-tokens, and ten Euler diffusion steps. Each set has one
-independently sampled reasoning continuation; each sample within that set has an
-expert trajectory conditioned on that continuation. Thus `6 / 1` generates six
-reasoning continuations and six total trajectories, while `1 / 6` generates one
-reasoning continuation and six trajectories. Override these settings explicitly:
+tokens, and ten Euler diffusion steps. The model prefills
+the prompt once, then samples `num_traj_sets * num_traj_samples` independent
+reasoning continuations. Each continuation conditions one expert trajectory;
+the set and sample dimensions group these candidates in the output. Both `6 / 1`
+and `1 / 6` generate six reasoning continuations and six trajectories. The CLI
+seeds text generation and a separate diffusion generator for each input sample.
+Override the output grouping explicitly:
 
 ```bash
 python -m alpamayo2_edge.inference \
     --model-id "$EDGE_MODEL" \
     --manifest examples/nav_samples.json \
     --num-traj-sets 1 --num-traj-samples 6 \
-    --output outputs/one-reasoning-six-trajectories
+    --output outputs/six-independent-trajectories
 ```
 
 Use a standalone local model directory with your own raw sample directory:
