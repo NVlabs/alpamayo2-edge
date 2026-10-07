@@ -3,7 +3,7 @@
 
 # Alpamayo 2 Edge
 
-Standalone PyTorch inference for the Qwen3-VL 2B Alpamayo 2 Edge checkpoint and its
+Standalone PyTorch inference for the CosmosReason 2 (2B) Alpamayo 2 Edge checkpoint and its
 trajectory diffusion expert. Given six-camera observations, ego history, and a
 navigation instruction, the model generates driving reasoning and 64 future poses
 at 0.1-second intervals.
@@ -13,7 +13,7 @@ Early-access weights are hosted at
 Model access requires an authorized Hugging Face account. The model files are at
 the repository root; no `--subfolder` is needed. Load example clips directly from
 PhysicalAI-AV or provide your own raw samples. This implementation supports the
-Qwen3-VL checkpoint and its 22-image, 20-pose input profile.
+CosmosReason 2 checkpoint and its 22-image, 20-pose input profile.
 
 ## Setup
 
