@@ -3,20 +3,61 @@
 
 # Checkpoint validation
 
-The complete model ran successfully on all ten supplied examples with both SDPA
-and FlashAttention 2 on an **NVIDIA H100 80GB HBM3**. Every run generated six
+## EA repository download and inference
+
+On 2026-10-07, inference succeeded after downloading directly from
+[nvidia/EA-Alpamayo2-Edge](https://huggingface.co/nvidia/EA-Alpamayo2-Edge/tree/b9d768920e925d8088afb2c628aa33acc3d36576),
+revision `b9d768920e925d8088afb2c628aa33acc3d36576`. Both the HF Hub cache and Xet
+cache started empty. The CLI received the repository ID and immutable revision;
+its report resolves to the new EA snapshot. All 14 downloaded model assets,
+including both complete weight shards, matched the uploaded SHA256 hashes.
+
+The input was the [public PhysicalAI-AV navigation example](#public-physicalai-av-navigation-example):
+clip `ea7bbd31-b7a5-4972-8dbd-7089e6b53de4` at 4.0 seconds, with
+`Turn right in 30m`, 22 camera frames, and 20 historical ego poses. On H100 80GB
+with BF16 and SDPA, six reasoning continuations each produced one trajectory.
+XYZ and rotations were finite, shaped `[1, 6, 1, 64, 3]` and
+`[1, 6, 1, 64, 3, 3]`. Loading reported no missing, unexpected, or mismatched
+keys and no errors. The runtime, dataset revision, and sampling settings match
+the public-example table below. This verifies downloading, loading, and inference;
+it does not establish benchmark quality or tuned performance.
+
+For this same public clip, every packed input tensor, generated token ID, and
+predicted XYZ/rotation tensor is exactly equal to the earlier run using the
+original local checkpoint. This checks that the release config migration
+preserves the observed inference result for this example.
+
+The published configuration uses `Alpamayo2Edge`, `alpamayo2_edge`, and
+`alpamayo2_edge_expert`, with standalone Hydra targets and stale backbone paths
+removed. All 193 numerical/Boolean config values are unchanged. Weight shards,
+tokenizer, processors, generation config, and chat template are byte-identical
+to the original checkpoint. HF contains those model assets and a model card
+template; examples and reference outputs were not uploaded.
+
+Local evidence is in `.work/ea-download-validation/preflight.json`,
+`download-audit.json`, and `output/report.json`. The upload and full download hash
+audits are `.work/ea-release/upload-result.json` and
+`.work/ea-release/fresh-download-sha256.json`; the before/after comparison is
+`.work/ea-release/fresh-vs-original-public-nav.json`. Use the
+[README example](../README.md#run-a-physicalai-av-navigation-example) to reproduce.
+
+## Original checkpoint bundle validation
+
+The original checkpoint bundle's complete model ran successfully on all ten
+supplied examples with both SDPA and FlashAttention 2 on an **NVIDIA H100 80GB
+HBM3**. Every run generated six
 reasoning continuations, one expert trajectory per continuation, and 64 waypoints
 per trajectory. All output positions and rotations were finite and had shapes
 `[1, 6, 1, 64, 3]` and `[1, 6, 1, 64, 3, 3]` respectively.
 
-The tested source is `nvidia/Internal-Alpamayo2-Edge`, checkpoint step **6530**,
-bundle `2b/1002_model1_v3_plain_vqa1000_step6530`, HF revision
+The source for these historical comparisons is `nvidia/Internal-Alpamayo2-Edge`,
+checkpoint step **6530**, bundle `2b/1002_model1_v3_plain_vqa1000_step6530`, HF revision
 `7db095f3f1c54e2236f96e1baf12c2bc3c5ee9e4`. The runtime used PyTorch 2.8.0+cu128,
 Transformers 5.17.0, and BF16. Settings followed the manifest: seed 43,
 temperature 0.6, top-p 0.98, no top-k limit, maximum generation length 256, and
 ten Euler diffusion steps.
 
-## Measured results
+### Measured results
 
 | Check | SDPA | FlashAttention 2 |
 | --- | --- | --- |
@@ -113,10 +154,13 @@ establish correct delivery of timing information; they do not measure how
 strongly the learned model uses it. Changes within the same 0.1-second rounding
 interval can intentionally produce identical token IDs.
 
-## Reproduce inference
+## Reproduce the original bundle comparisons
 
-Follow the [README download instructions](../README.md#download-the-checkpoint-and-examples)
-to populate `EDGE_BUNDLE`, then run from the repository root:
+These historical commands require separate access to the original private bundle
+identified above, including its raw examples and reference outputs. Set
+`EDGE_BUNDLE` to that local bundle directory, then run from the repository root.
+The EA HF repository contains model assets only; for a directly downloadable
+inference example, use the [public clip instructions](../README.md#run-a-physicalai-av-navigation-example).
 
 ```bash
 uv sync --locked --dev
@@ -165,11 +209,12 @@ published navigation example, not a navigation-quality metric or a comparison
 with Super's classifier-free guidance outputs.
 
 Follow the [public clip setup instructions](../README.md#run-a-physicalai-av-navigation-example),
-then reproduce with the same local checkpoint used above:
+then run the published EA checkpoint with the same sampling settings:
 
 ```bash
 python -m alpamayo2_edge.inference \
-    --model-id "$EDGE_BUNDLE/model" \
+    --model-id nvidia/EA-Alpamayo2-Edge \
+    --revision b9d768920e925d8088afb2c628aa33acc3d36576 \
     --manifest examples/nav_samples.json \
     --num-traj-sets 6 --num-traj-samples 1 \
     --attn-implementation sdpa --output outputs/physicalai-nav
@@ -193,7 +238,8 @@ manifest navigation selection/overrides.
 Ruff checks, formatting, lockfile validation, and source/wheel builds also passed.
 
 Run `CUDA_VISIBLE_DEVICES="" uv run --locked pytest` for the CPU suite. The saved
-fixture comparison and processor timestamp test require the downloaded private bundle:
+fixture comparison and processor timestamp test require the original private
+bundle (these fixtures are not in the EA HF repository):
 
 ```bash
 CUDA_VISIBLE_DEVICES="" ALPAMAYO2_EDGE_TEST_BUNDLE="$EDGE_BUNDLE" \
