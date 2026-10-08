@@ -226,6 +226,164 @@ report records the dataset revision and decoder dependency versions. Dataset
 revisions can be selected through a supplied `PhysicalAIAVDatasetInterface` in
 the Python API; the CLI resolves the SDK's default dataset revision at run time.
 
+## Inference acceleration
+
+On 2026-10-08, the opt-in acceleration described in
+[acceleration.md](acceleration.md) was compared with the default path on the
+same inputs and seeds.
+
+### Inputs and settings
+
+The inputs are 33 packed samples of the 1002 checkpoint's internal evaluation
+suite `cot_public_golden`: 3 warm-up and 30 timed. Each has 22 images in two
+patch grids, about 3,240 prompt tokens, and the 6.4-second ground-truth future,
+which is used only for minADE. These samples are not distributed. Each sample
+has a fixed seed for text sampling and diffusion noise. Settings follow the CLI
+defaults: temperature 0.6, top-p 0.98, at most 256 generated tokens and ten Euler
+steps; greedy runs add `top_k=1`. Latency is the synchronized model call
+(`sample_trajectories_from_data`) with inputs already on the GPU, as p50 and p90
+over the 30 timed samples. Calls that built graphs are excluded.
+
+### Environments
+
+Both environments ran on one node of NVIDIA H100 80GB HBM3 GPUs:
+
+| | Release environment | FlashAttention 3 environment |
+| --- | --- | --- |
+| Packages | `uv.lock` (PyTorch 2.8.0+cu128, Transformers 5.17.0, Triton 3.4.0) plus the prebuilt FlashAttention 2.8.3 wheel | PyTorch 2.8.0+cu128, Transformers 5.17.0, Triton 3.4.0, FlashAttention 2.8.3 and 3.0.0 |
+| Attention in the graphs | SDPA for vision and prefill; FA2 for decode and the expert | FA3 for vision and prefill; FA2 for decode and the expert |
+
+The FlashAttention 2 wheel needs glibc 2.32 or newer, so the release environment
+ran in an Ubuntu 22.04 userspace. Each option was compared with the default path
+of its own environment; the two default paths produced bitwise-identical outputs
+for all samples.
+
+### Parity on H100
+
+The table lists the share of CoTs with identical tokens and the mean XY distance
+to the default trajectory where the CoT is identical. ΔminADE is the paired mean
+difference to the default path with a bootstrap 95% interval. The default
+minADE is 2.792 m for greedy decoding with one CoT and 1.348 m with six CoTs.
+
+| Option | Identical CoTs (greedy / sampled / six CoTs) | XY distance, same CoT | ΔminADE, greedy, one CoT | ΔminADE, six CoTs |
+| --- | --- | --- | --- | --- |
+| `--patch-embed linear` | 90.9% / 97.0% / 96.0% | 1.8 cm | +0.002 m [-0.007, +0.012] | -0.003 m [-0.012, +0.004] |
+| ViT cache, eager | 100% / 100% / 100% | 0 (bitwise) | 0 | 0 |
+| `--accel compile` | 93.9% / 97.0% / 94.9% | 2.5 cm | +0.010 m [-0.006, +0.034] | -0.000 m [-0.012, +0.011] |
+| `--accel tuned` | 87.9% / 97.0% / 97.0% | 2.7 cm | +0.011 m [-0.006, +0.036] | -0.000 m [-0.013, +0.011] |
+| `--accel tuned` with the ViT cache | 93.9% / 97.0% / 97.0% | 2.6 cm | +0.011 m [-0.006, +0.036] | -0.005 m [-0.027, +0.010] |
+| All options | 87.9% / 100% / 96.5% | 2.5 cm | +0.008 m [-0.005, +0.026] | -0.008 m [-0.032, +0.007] |
+| `--accel tuned`, FA3 | 87.9% / 100% / 95.5% | 3.3 cm | +0.012 m [-0.009, +0.046] | -0.006 m [-0.029, +0.010] |
+| All options, FA3 | 87.9% / 97.0% / 96.0% | 2.2 cm | +0.004 m [-0.009, +0.019] | -0.002 m [-0.015, +0.008] |
+
+Every interval includes zero; with 33 samples, the intervals span 1–3% of
+minADE. One sample (ADE 7.4 m) dominates the positive one-CoT means. Its CoT is
+unchanged, but its trajectory reacts to any numerical change: the GEMM patch
+embedding alone moves it by 10 cm on average, and acceleration by 35 cm. The
+other samples' differences are centered near zero. No accelerated output was
+bitwise identical to the default path, whereas the eager ViT cache reproduced
+all 33 samples bit for bit under all three protocols.
+
+With the compiled vision graphs, the ViT cache changes outputs relative to
+`--accel tuned` alone: 93.9% of greedy CoTs, all sampled one-CoT CoTs and 98% of
+six-CoT CoTs stay identical. Same-CoT trajectories move by 0.6 cm, and greedy
+minADE changes by -0.0001 m [-0.006, +0.005].
+
+### Latency on H100
+
+Each environment ran its options back to back in one process on an otherwise
+idle node, on one model instance. Accelerated options first ran one untimed
+pass over all inputs, after their graphs were built. The table lists p50 and
+p90 over the 30 timed samples in milliseconds, with the speedup of the p50 over
+the same environment's default path. The ViT cache rows measure streaming
+steady state: past frames come from an earlier encoding, and the six newest
+frames are encoded in the timed call.
+
+| Option | One CoT, p50 / p90 | Six CoTs, p50 / p90 |
+| --- | --- | --- |
+| Default, release environment | 945 / 1,138 | 1,080 / 1,246 |
+| `--accel compile` | 140 / 163 (6.7x) | 482 / 509 (2.2x) |
+| `--accel tuned` | 128 / 148 (7.4x) | 484 / 510 (2.2x) |
+| `--accel tuned` with the ViT cache | 115 / 135 (8.2x) | 476 / 510 (2.3x) |
+| All options | 115 / 134 (8.2x) | 475 / 507 (2.3x) |
+| Default, FA3 environment | 991 / 1,194 | 1,134 / 1,304 |
+| `--accel tuned`, FA3 | 123 / 142 (8.1x) | 494 / 520 (2.3x) |
+| `--accel tuned`, FA3, with the ViT cache | 111 / 130 (8.9x) | 488 / 515 (2.3x) |
+| All options, FA3 | 110 / 129 (9.0x) | 487 / 516 (2.3x) |
+
+With six CoTs, only vision and decoding are graphed. The prefill runs eagerly
+into the static cache, and the expert runs eagerly unless all six CoTs have the
+same length, which was true for 5 of the 33 inputs.
+
+The default path is host-bound, and its p50 varied by up to 7% between runs
+(945–1,008 ms). That masks small differences between sequential runs, so the eager
+ViT cache was measured with alternating uncached and cached calls on the same
+inputs. It saved 33 ms per call: the vision tower took 24 ms instead of 58 ms.
+With the compiled graphs, the cache saved 13 ms per call (vision graphs: 7 ms
+instead of 22 ms). The GEMM patch embedding made no measurable difference on the
+H100, where BF16 Conv3d is fast.
+
+Peak allocated memory was 5.64 GB for one CoT and 8.61 GB for six CoTs on the
+default path, 5.91 and 8.75 GB with `--accel tuned`, and 6.53 and 9.36 GB with the
+ViT cache added. The cache held 256 frames. From an empty compiler cache, building
+the eight graphs for one and six CoTs took 123 s with `--accel compile`, 170 s with
+`--accel tuned`, and 191 s with FA3; the ViT cache adds two vision graphs (193 s
+in total). With a populated cache, building six of the graphs took 23 s.
+
+### Default path and CLI
+
+On one raw internal sample, the CLI produced byte-identical
+`output.safetensors`, `packed.safetensors` and `prompt.txt` with this change
+and with `main`, for one and six CoTs on the H100 and for one CoT in FP32 on CPU.
+The reports differ only in elapsed time. With the CLI's sampling settings,
+`--accel tuned` generated the same CoT tokens as the default path, with
+trajectories within 1.6 cm (6.1 cm with FA3). Its `report.json` recorded five
+graph builds and no fallbacks. With six CoTs, five of six CoTs matched.
+
+### CPU checks on the real checkpoint
+
+`AccelConfig(compile=False, cuda_graphs=False)` runs the accelerated code without
+compilation or graphs, with PyTorch reference attention. On packed samples from
+the inputs above, in FP32 on CPU, compared with the default path:
+
+| Check | Result |
+| --- | --- |
+| Greedy, one CoT | Tokens identical (24 CoT tokens and the anchor); max XYZ difference 9.5e-7 m |
+| Greedy, two CoTs | Tokens identical; max XYZ difference 3.8e-6 m |
+| CLI sampling settings, three CoTs, two samples | All tokens identical; trajectories bitwise equal |
+| ViT cache: 16 frames reused, 6 encoded | Tokens identical; trajectories bitwise equal |
+
+These checks exercise the port to Transformers 5.17 with the real shapes: two
+patch grids, three DeepStack levels, MRoPE positions, the shared prefill, the
+sampler's random draws, and the expert reading the static cache, both graphed
+and through the eager fallback for CoTs of different lengths. They do not
+cover compiled kernels or CUDA graphs.
+
+The test suite passed 104 tests on CPU, skipping the GPU test and the two
+private-bundle tests, and 105 tests on the H100. New tests cover the GEMM patch
+embedding against the Conv3d, kernel selection per GPU, the static cache's
+`DynamicCache` behavior, the CPU attention reference, vision grouping against
+the Transformers tower, accelerated sampling and anchor completion against the
+eager model on a tiny Qwen3-VL, eager fallbacks, warm-up, the ViT cache's reuse,
+keys and eviction, and the new CLI options. The GPU test compares compiled CUDA
+graphs with eager execution on the tiny model.
+
+### Earlier evidence
+
+The same techniques were first evaluated on this checkpoint in NVIDIA's internal
+Alpamayo training code, with Transformers 4.57.6 on H100, before this port. On
+2,643 evaluation samples with six CoTs each, the tuned configuration changed
+minADE by -0.0021 m [-0.0048, +0.0004] and 94% of CoTs were identical. A greedy
+one-CoT run with all four graphs active changed it by -0.00003 m
+[-0.0021, +0.0020], with 96.3% identical CoTs. Where a greedy CoT differed, the
+eager model's two best logits at the first differing token were within one or two
+BF16 ulps. Without FlashAttention 3, the greedy change was +0.0041 m
+[+0.0003, +0.0093], or +0.2%. One CoT took 133.9 ms instead of 1,216 ms (117.5 ms
+with the ViT cache). On DGX Spark (GB10, PyTorch 2.9.1, GEMM patch embedding in
+both arms), it took 749 ms instead of 1,615 ms. These numbers come from a
+different pipeline and Transformers version; they are context for the
+measurements above, not a substitute for them.
+
 ## CPU tests
 
 The full suite passed **78 tests**, including the optional real-bundle input

@@ -253,6 +253,60 @@ chosen dataset revision/cache to be reused across multiple clips.
 The third model return value is a placeholder log probability and should not be
 used to rank candidates. The CLI checks trajectory shapes and finite values.
 
+## Accelerated inference
+
+Opt-in BF16 speedups in `alpamayo2_edge.accel` keep the model and its sampling
+semantics and change only how the GPU executes them. The defaults are unchanged,
+and nothing is quantized. On an H100, `--accel tuned` ran one CoT and its
+trajectory in 128 ms instead of 945 ms (7.4x), and in 115 ms with the ViT cache
+in streaming use; six CoTs took 484 ms instead of 1,080 ms. Install
+FlashAttention 2 first ([details](docs/acceleration.md#requirements)), then add
+`--accel tuned`:
+
+```bash
+python -m alpamayo2_edge.inference \
+    --model-id "$EDGE_MODEL" \
+    --manifest examples/nav_samples.json \
+    --accel tuned \
+    --output outputs/accelerated
+```
+
+- `--accel compile` or `--accel tuned` runs the vision tower, prompt prefill,
+  CoT decoding (including sampling) and the flow-matching loop with
+  `torch.compile` and CUDA graphs. `tuned` also autotunes the decode step. The
+  first input compiles and captures the graphs; later inputs with the same
+  shapes replay them.
+- `--accel-attention` selects the attention kernel inside the vision and
+  prefill graphs. The default `auto` uses FlashAttention 3 on Hopper when it is
+  installed, otherwise PyTorch SDPA.
+- `--patch-embed linear` computes the vision patch embedding as one GEMM. Use it
+  where BF16 Conv3d is slow, such as PyTorch 2.9 on DGX Spark (GB10).
+- `VisionFeatureCache` (Python API) reuses vision features of frames already
+  encoded in earlier calls of a stream, so consecutive time steps encode only the
+  newest frame of each camera.
+
+Caveats:
+
+- The first call for each new input shape compiles and captures graphs inline:
+  2–3 minutes from an empty compiler cache on an H100, about 23 s with a
+  populated one. Set `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` to keep the
+  cache across processes.
+- Graph shapes are static. A new image resolution, a prompt that crosses a
+  256-token bucket, or a different CoT count, generation length or sampling
+  setting builds new graphs on first use.
+- With several CoTs, only vision and decoding are graphed; six CoTs ran 2.2x
+  faster rather than 7.4x.
+- The ViT cache helps only for consecutive time steps of one stream. Call
+  `clear()` when the stream changes.
+- Accelerated outputs are not bitwise identical to the default path: compiled
+  kernels round BF16 differently, which can change a sampled token where two
+  candidates are nearly tied.
+
+The [acceleration guide](docs/acceleration.md) covers requirements, the Python
+API, which calls are graphed and the ViT cache. [Validation
+results](docs/validation.md#inference-acceleration) list the measured latency
+and parity.
+
 For development, run `uv run --locked pytest`. See
 [validation results and reproduction commands](docs/validation.md) for measured
 checkpoint loading, preprocessing, and GPU inference results, including remaining
