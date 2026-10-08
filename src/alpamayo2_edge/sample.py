@@ -104,15 +104,20 @@ def validate_sample(data: Mapping[str, Any], history_num_steps: int = 20) -> Non
         normalize_camera_pixel_bounds(data["camera_pixel_bounds"])
 
 
+def canonical_frame_order(camera_indices: torch.Tensor, timestamps: torch.Tensor) -> torch.Tensor:
+    """Frame indices sorted by camera, then capture timestamp."""
+    timestamps = timestamps.reshape(-1)
+    # Two stable sorts avoid subtracting large epoch timestamps or assuming a
+    # fixed camera cadence. Sorting order is identical to Python (camera, time).
+    by_time = torch.argsort(timestamps, stable=True)
+    return by_time[torch.argsort(camera_indices[by_time], stable=True)]
+
+
 def canonicalize_sample(data: Mapping[str, Any], history_num_steps: int = 20) -> dict[str, Any]:
     """Sort all frame-aligned fields together by camera, then capture timestamp."""
     validate_sample(data, history_num_steps=history_num_steps)
     result = dict(data)
-    timestamps = data["absolute_timestamps"].reshape(-1)
-    # Two stable sorts avoid subtracting large epoch timestamps or assuming a
-    # fixed camera cadence. Sorting order is identical to Python (camera, time).
-    by_time = torch.argsort(timestamps, stable=True)
-    order = by_time[torch.argsort(data["camera_indices"][by_time], stable=True)]
+    order = canonical_frame_order(data["camera_indices"], data["absolute_timestamps"])
     for key in ("image_frames", "camera_indices", "absolute_timestamps"):
         result[key] = data[key][order]
     result["camera_pixel_bounds"] = {

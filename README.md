@@ -253,6 +253,72 @@ chosen dataset revision/cache to be reused across multiple clips.
 The third model return value is a placeholder log probability and should not be
 used to rank candidates. The CLI checks trajectory shapes and finite values.
 
+## Accelerated inference
+
+Opt-in BF16 speedups in `alpamayo2_edge.accel` keep the model and its sampling
+semantics and change only how the GPU executes them. The defaults are unchanged,
+and nothing is quantized. On an H100, with `--accel tuned`, the model call (inputs
+already on the GPU, preprocessing excluded) took 127 ms instead of 952 ms for one
+CoT and its trajectory (7.5x), and 115 ms with the ViT cache in streaming use;
+six CoTs took 488 ms instead of 1,099 ms. Install FlashAttention 2 first
+([details](docs/acceleration.md#requirements)), then add `--accel tuned`:
+
+```bash
+python -m alpamayo2_edge.inference \
+    --model-id "$EDGE_MODEL" \
+    --manifest examples/nav_samples.json \
+    --accel tuned \
+    --output outputs/accelerated
+```
+
+- `--accel compile` or `--accel tuned` runs the vision tower, prompt prefill,
+  CoT decoding (including sampling) and the flow-matching loop with
+  `torch.compile` and CUDA graphs. `tuned` also autotunes the decode step. The
+  first input compiles and captures the graphs; later inputs with the same
+  shapes replay them. Without FlashAttention 2, `--accel` stops with an error;
+  `--accel-allow-partial` accelerates the vision tower only.
+- `--accel-attention` selects the attention kernel inside the vision and
+  prefill graphs. The default `auto` uses FlashAttention 3 on Hopper when it is
+  installed, otherwise PyTorch SDPA.
+- `--patch-embed linear` computes the vision patch embedding as one GEMM. Use it
+  where BF16 Conv3d is slow, such as PyTorch 2.9 on DGX Spark (GB10).
+- `VisionFeatureCache` (Python API) reuses vision features of frames already
+  encoded in earlier calls of a stream, so consecutive time steps encode only the
+  newest frame of each camera.
+
+Caveats:
+
+- The first call for each new input shape compiles and captures graphs inline:
+  about 2 minutes for the first one-CoT call from an empty compiler cache on an
+  H100, much less with a populated one (six graphs in 23 s). Set
+  `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` to keep the cache across
+  processes.
+- Graph shapes are static. A new image resolution, a prompt that crosses a
+  256-token bucket, or a different CoT count, generation length or sampling
+  setting builds new graphs on first use. With the ViT cache, the first two
+  seconds of a stream also build up to six extra vision graphs (11–13 s each);
+  [warm up](docs/acceleration.md#compilation-shapes-and-memory) with a recorded
+  stream to keep them out of live operation.
+- With several CoTs, the prefill runs eagerly and the expert graph replays only
+  when all CoTs have the same length, so six CoTs ran 2.3x faster rather than
+  7.5x.
+- The ViT cache helps only for consecutive time steps of one stream. Call
+  `clear()` when the stream changes and after changing the model.
+- Accelerated outputs are not bitwise identical to the default path: compiled
+  kernels round BF16 differently, which can change a sampled token where two
+  candidates are nearly tied. On 33 samples, every minADE difference had a 95%
+  interval that included zero. The 2,643-sample evaluation of an earlier
+  prototype covers `--accel tuned` with FlashAttention 3 (no measurable change).
+  In that evaluation, `compile` with SDPA attention changed greedy minADE by a
+  small but significant +0.2%. The SDPA configurations that the release
+  environment uses are covered only by the 33-sample check
+  ([details](docs/validation.md#inference-acceleration)).
+
+The [acceleration guide](docs/acceleration.md) covers requirements, the Python
+API, which calls are graphed and the ViT cache. [Validation
+results](docs/validation.md#inference-acceleration) list the measured latency
+and parity.
+
 For development, run `uv run --locked pytest`. See
 [validation results and reproduction commands](docs/validation.md) for measured
 checkpoint loading, preprocessing, and GPU inference results, including remaining

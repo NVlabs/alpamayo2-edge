@@ -35,6 +35,50 @@ def _json_value(value):
     return value
 
 
+def predict(model, prepared: dict, settings: dict, device: str) -> tuple:
+    """Seed text and diffusion sampling, then run the model on prepared inputs."""
+    torch.manual_seed(settings["seed"])
+    generator = torch.Generator(device=device).manual_seed(settings["seed"])
+    with (
+        torch.inference_mode(),
+        torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=model.dtype,
+            enabled=model.dtype != torch.float32,
+        ),
+    ):
+        xyz, rot, _, extra = model.sample_trajectories_from_data(
+            prepared,
+            num_traj_sets=settings["num_traj_sets"],
+            num_traj_samples=settings["num_traj_samples"],
+            top_p=settings["top_p"],
+            top_k=settings["top_k"],
+            temperature=settings["temperature"],
+            max_generation_length=settings["max_generation_length"],
+            diffusion_kwargs={**settings["diffusion_kwargs"], "generator": generator},
+            return_extra=True,
+        )
+    return xyz, rot, extra
+
+
+def warm_up(model, data: dict, settings: dict, device: str, runs: int) -> None:
+    """Untimed runs that compile and capture the accelerated graphs for ``data``."""
+    from alpamayo2_edge.helper import prepare_model_inputs, to_device
+
+    prepared = to_device(prepare_model_inputs(data, model.config, model.tokenizer), device=device)
+    for _ in range(runs):
+        predict(model, prepared, settings, device)
+
+
+def _package_version(name: str) -> str | None:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+
+
 def run_sample(model, sample_path: Path, output: Path, settings: dict, device: str) -> dict:
     from alpamayo2_edge.sample import load_sample
 
@@ -69,27 +113,7 @@ def run_data(model, data: dict, sample_id: str, output: Path, settings: dict, de
         {f"traj_data.{key}": value.cpu().contiguous() for key, value in histories.items()}
     )
     prepared = to_device(prepared, device=device)
-    torch.manual_seed(settings["seed"])
-    generator = torch.Generator(device=device).manual_seed(settings["seed"])
-    with (
-        torch.inference_mode(),
-        torch.autocast(
-            device_type=torch.device(device).type,
-            dtype=model.dtype,
-            enabled=model.dtype != torch.float32,
-        ),
-    ):
-        xyz, rot, _, extra = model.sample_trajectories_from_data(
-            prepared,
-            num_traj_sets=settings["num_traj_sets"],
-            num_traj_samples=settings["num_traj_samples"],
-            top_p=settings["top_p"],
-            top_k=settings["top_k"],
-            temperature=settings["temperature"],
-            max_generation_length=settings["max_generation_length"],
-            diffusion_kwargs={**settings["diffusion_kwargs"], "generator": generator},
-            return_extra=True,
-        )
+    xyz, rot, extra = predict(model, prepared, settings, device)
     validate_predictions(xyz, rot, settings["num_traj_sets"], settings["num_traj_samples"])
     if torch.device(device).type == "cuda":
         torch.cuda.synchronize(device)
@@ -205,6 +229,39 @@ def main(argv=None) -> None:
     parser.add_argument("--max-generation-length", type=int)
     parser.add_argument("--diffusion-steps", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--accel",
+        choices=["off", "compile", "tuned"],
+        default="off",
+        help="torch.compile + CUDA graphs for vision, prefill, decode and the expert "
+        "(CUDA, BF16, needs flash-attn); tuned also autotunes the decode step",
+    )
+    parser.add_argument(
+        "--accel-attention",
+        choices=["auto", "fa3", "sdpa"],
+        default="auto",
+        help="Vision/prefill attention in the graphs; auto uses FlashAttention 3 on Hopper "
+        "when installed, otherwise SDPA",
+    )
+    parser.add_argument(
+        "--accel-warmup",
+        type=int,
+        default=1,
+        help="Untimed runs of the first input that compile and capture graphs (with --accel)",
+    )
+    parser.add_argument(
+        "--accel-allow-partial",
+        action="store_true",
+        help="With --accel, continue when flash-attn is missing: only the vision tower is "
+        "accelerated (otherwise this is an error)",
+    )
+    parser.add_argument(
+        "--patch-embed",
+        choices=["conv", "linear"],
+        default="conv",
+        help="Vision patch embedding: the checkpoint's Conv3d or the equivalent GEMM, which "
+        "avoids slow BF16 Conv3d kernels (e.g. PyTorch 2.9 on GB10)",
+    )
     args = parser.parse_args(argv)
     clip = None
     if args.model_id and not (args.sample or args.clip_id or args.manifest):
@@ -236,6 +293,27 @@ def main(argv=None) -> None:
         parser.error(
             "CUDA is unavailable; run on a GPU host or explicitly select --device cpu --dtype float32"
         )
+    if args.accel != "off" and (
+        torch.device(args.device).type != "cuda" or args.dtype != "bfloat16"
+    ):
+        parser.error("--accel requires a CUDA --device and --dtype bfloat16")
+    if args.accel_warmup < 0:
+        parser.error("--accel-warmup must be nonnegative")
+    if args.accel_allow_partial and args.accel == "off":
+        parser.error("--accel-allow-partial requires --accel")
+    if args.accel != "off":
+        from alpamayo2_edge.accel import resolve_kernels
+
+        try:
+            kernels = resolve_kernels(args.accel_attention, args.device)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if kernels["decode"] is None and not args.accel_allow_partial:
+            parser.error(
+                "--accel needs an importable flash_attn (FlashAttention 2) for the prefill, "
+                "decode and expert graphs; without it only the vision tower is accelerated. "
+                "Install it (see docs/acceleration.md#requirements) or pass --accel-allow-partial."
+            )
     settings = dict(
         seed=43,
         top_p=0.98,
@@ -292,6 +370,20 @@ def main(argv=None) -> None:
         revision=args.revision,
         local_files_only=args.local_files_only,
     )
+    acceleration = None
+    if args.patch_embed == "linear":
+        from alpamayo2_edge.accel import use_linear_patch_embedding
+
+        use_linear_patch_embedding(model)
+    if args.accel != "off":
+        from alpamayo2_edge.accel import AccelConfig, enable_acceleration
+        from alpamayo2_edge.sample import load_sample
+
+        acceleration = enable_acceleration(
+            model, AccelConfig(mode=args.accel, attention=args.accel_attention)
+        )
+        first = data if clip is not None else load_sample(samples[0])
+        warm_up(model, first, settings, args.device, args.accel_warmup)
     if clip is not None:
         sample_id = f"{clip['clip_id']}_{clip['t0_us']}"
         records = [run_data(model, data, sample_id, args.output / sample_id, settings, args.device)]
@@ -312,6 +404,14 @@ def main(argv=None) -> None:
         "loading_info": loading_info,
         "samples": records,
     }
+    if args.patch_embed != "conv":
+        report["patch_embedding"] = args.patch_embed
+    if acceleration is not None:
+        report["acceleration"] = {
+            **acceleration.describe(),
+            "warmup_runs": args.accel_warmup,
+            "flash_attn": _package_version("flash-attn"),
+        }
     if clip is not None:
         from importlib.metadata import version
 
