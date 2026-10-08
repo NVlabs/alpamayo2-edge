@@ -1,17 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Load portable Edge input samples without loading labels or Python objects."""
+"""Validate and order in-memory Edge inference inputs."""
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import torch
-from safetensors import safe_open
 
 CAMERA_FRAME_COUNTS = {0: 3, 1: 5, 2: 3, 3: 3, 5: 3, 6: 5}
 CAMERA_PIXEL_BOUNDS = {
@@ -28,7 +25,7 @@ INPUT_TENSOR_KEYS = (
 
 
 def normalize_camera_pixel_bounds(bounds: Mapping[Any, Any]) -> dict[int, tuple[int, int]]:
-    """Restore integer camera keys lost during JSON serialization."""
+    """Validate per-camera pixel budgets and normalize camera IDs."""
     if not isinstance(bounds, Mapping):
         raise TypeError("camera_pixel_bounds must be a camera-to-pixel-bounds mapping")
     normalized = {}
@@ -125,41 +122,3 @@ def canonicalize_sample(data: Mapping[str, Any], history_num_steps: int = 20) ->
         **normalize_camera_pixel_bounds(data.get("camera_pixel_bounds", {})),
     }
     return result
-
-
-def load_sample(path: str | Path) -> dict[str, Any]:
-    """Read ``sample.json`` and raw input safetensors from one sample directory.
-
-    Both ``input.safetensors`` and the checkpoint bundle's ``tensors.safetensors``
-    filename are supported. Only the five inference tensor fields are read;
-    ``ground_truth.safetensors`` is never opened. The returned dictionary retains
-    the capture order from disk. :func:`prepare_model_inputs` performs sorting.
-    """
-    path = Path(path)
-    if path.is_dir():
-        folder = path
-        tensor_path = folder / "input.safetensors"
-        if not tensor_path.is_file():
-            tensor_path = folder / "tensors.safetensors"
-    else:
-        if path.name not in ("input.safetensors", "tensors.safetensors"):
-            raise ValueError(
-                "Provide a sample directory, input.safetensors, or tensors.safetensors"
-            )
-        folder, tensor_path = path.parent, path
-    with (folder / "sample.json").open(encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    if not isinstance(metadata, dict):
-        raise ValueError("sample.json must contain a JSON object")
-    if set(INPUT_TENSOR_KEYS).intersection(metadata):
-        raise ValueError("sample.json must not redefine raw tensor fields")
-    data = dict(metadata)
-    with safe_open(tensor_path, framework="pt", device="cpu") as handle:
-        missing = set(INPUT_TENSOR_KEYS) - set(handle.keys())
-        if missing:
-            raise ValueError(f"Raw sample is missing required tensors: {sorted(missing)}")
-        data.update({key: handle.get_tensor(key) for key in INPUT_TENSOR_KEYS})
-    if "camera_pixel_bounds" in data:
-        data["camera_pixel_bounds"] = normalize_camera_pixel_bounds(data["camera_pixel_bounds"])
-    validate_sample(data)
-    return data

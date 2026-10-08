@@ -1,16 +1,12 @@
 """Input contracts that protect camera, timestamp, and trajectory alignment."""
 
-import json
-import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
 
 from alpamayo2_edge.helper import create_messages, to_device
-from alpamayo2_edge.sample import canonicalize_sample, load_sample, validate_sample
+from alpamayo2_edge.sample import canonicalize_sample, validate_sample
 
 
 def raw_sample():
@@ -44,21 +40,13 @@ def config():
     )
 
 
-@pytest.mark.parametrize("filename", ["input.safetensors", "tensors.safetensors"])
-def test_load_sample_reads_only_inputs_and_normalizes_camera_keys(tmp_path, filename):
+def test_canonicalize_sample_normalizes_camera_pixel_bounds():
     data = raw_sample()
-    tensors = {key: value for key, value in data.items() if isinstance(value, torch.Tensor)}
-    tensors["ego_future_xyz"] = torch.full((1, 64, 3), 999.0)
-    save_file(tensors, tmp_path / filename)
-    (tmp_path / "ground_truth.safetensors").write_text("must never be opened")
-    (tmp_path / "sample.json").write_text(
-        json.dumps({"nav_text": data["nav_text"], "camera_pixel_bounds": {"1": [163840, 196608]}})
-    )
-    loaded = load_sample(tmp_path)
-    assert loaded["camera_pixel_bounds"] == {1: (163840, 196608)}
-    assert "ego_future_xyz" not in loaded
-    assert loaded["image_frames"].dtype == torch.uint8
-    assert loaded["ego_history_xyz"].shape == (1, 20, 3)
+    data["camera_pixel_bounds"] = {"1": [65536, 131072]}
+    canonical = canonicalize_sample(data)
+    assert canonical["camera_pixel_bounds"][1] == (65536, 131072)
+    assert canonical["camera_pixel_bounds"][0] == (81920, 98304)
+    assert data["camera_pixel_bounds"] == {"1": [65536, 131072]}
 
 
 def test_prompt_preserves_camera_order_relative_timestamps_and_navigation():
@@ -144,49 +132,3 @@ def test_to_device_keeps_integer_and_boolean_tensors():
     assert moved["mask"].dtype == torch.bool
     assert moved["nested"][0].dtype == torch.bfloat16
     assert moved["nested"][1][0].dtype == torch.bfloat16
-
-
-@pytest.mark.skipif(
-    not os.environ.get("ALPAMAYO2_EDGE_TEST_BUNDLE"),
-    reason="Set ALPAMAYO2_EDGE_TEST_BUNDLE to run saved checkpoint input parity",
-)
-def test_checkpoint_sample_000_matches_every_saved_packed_input():
-    """Exercise actual uint8 resizing and template/history tokenization together."""
-    from safetensors.torch import load_file
-    from transformers import AutoTokenizer
-
-    from alpamayo2_edge.config import Alpamayo2EdgeConfig, normalize_checkpoint_config
-    from alpamayo2_edge.helper import prepare_model_inputs
-    from alpamayo2_edge.models.delta_tokenizer import DeltaTrajectoryTokenizer
-
-    bundle = Path(os.environ["ALPAMAYO2_EDGE_TEST_BUNDLE"]).resolve()
-    cfg = Alpamayo2EdgeConfig(
-        **normalize_checkpoint_config(json.loads((bundle / "model/config.json").read_text()))
-    )
-    cfg._name_or_path = str(bundle / "model")
-    tokenizer = AutoTokenizer.from_pretrained(bundle / "model")
-    raw = load_sample(bundle / "samples/sample_000")
-    prepared = prepare_model_inputs(raw, cfg, tokenizer)
-    history_config = {
-        key: value for key, value in cfg.hist_traj_tokenizer_cfg.items() if key != "_target_"
-    }
-    history = (
-        DeltaTrajectoryTokenizer(**history_config).encode(
-            raw["ego_history_xyz"],
-            raw["ego_history_rot"],
-            raw["ego_history_xyz"],
-            raw["ego_history_rot"],
-        )
-        + cfg.traj_ids["history_id0"]
-    )
-    ids = prepared["tokenized_data"]["input_ids"]
-    mask = ids == cfg.traj_ids["history_pad"]
-    assert mask.sum().item() == 57
-    ids[mask] = history.reshape(-1)
-    reference = load_file(bundle / "reference/sample_000/packed.safetensors")
-    assert ids.shape == (1, 3236)
-    assert prepared["tokenized_data"]["pixel_values"].shape == (11568, 1536)
-    for key in ("input_ids", "attention_mask", "image_grid_thw", "pixel_values"):
-        assert torch.equal(prepared["tokenized_data"][key], reference["tokenized_data." + key]), key
-    for key in ("ego_history_xyz", "ego_history_rot"):
-        assert torch.equal(prepared[key], reference["traj_data." + key]), key

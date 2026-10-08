@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Run Edge inference on local samples or clips from PhysicalAI-AV."""
+"""Run Edge inference on clips from PhysicalAI-AV."""
 
 import argparse
 import json
@@ -77,12 +77,6 @@ def _package_version(name: str) -> str | None:
         return version(name)
     except PackageNotFoundError:
         return None
-
-
-def run_sample(model, sample_path: Path, output: Path, settings: dict, device: str) -> dict:
-    from alpamayo2_edge.sample import load_sample
-
-    return run_data(model, load_sample(sample_path), sample_path.name, output, settings, device)
 
 
 def run_data(model, data: dict, sample_id: str, output: Path, settings: dict, device: str) -> dict:
@@ -186,10 +180,10 @@ def load_clip_manifest(path: Path, index: int = 0, nav_text: str | None = None) 
 
 
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--bundle", type=Path, help="Local bundle containing model/ and samples/")
-    source.add_argument("--model-id", help="Local model directory or Hugging Face repository ID")
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "--model-id", required=True, help="Local model directory or Hugging Face repository ID"
+    )
     parser.add_argument(
         "--subfolder", default="", help="HF model subfolder, including model/ if needed"
     )
@@ -199,8 +193,7 @@ def main(argv=None) -> None:
         action="store_true",
         help="Use cached model files only; dataset access is controlled separately by the SDK",
     )
-    inputs = parser.add_mutually_exclusive_group()
-    inputs.add_argument("--sample", type=Path, help="Raw sample directory for --model-id")
+    inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--clip-id", help="PhysicalAI-AV clip UUID")
     inputs.add_argument("--manifest", type=Path, help="PhysicalAI-AV clip/time/navigation examples")
     parser.add_argument("--sample-index", type=int, help="Index in --manifest (default 0)")
@@ -210,10 +203,6 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--nav-text", help="Navigation for --clip-id, or an override for --manifest"
     )
-    parser.add_argument(
-        "--sample-id", action="append", help="Bundle sample ID (repeatable; default sample_000)"
-    )
-    parser.add_argument("--all-samples", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
@@ -263,27 +252,14 @@ def main(argv=None) -> None:
         "avoids slow BF16 Conv3d kernels (e.g. PyTorch 2.9 on GB10)",
     )
     args = parser.parse_args(argv)
-    clip = None
-    if args.model_id and not (args.sample or args.clip_id or args.manifest):
-        parser.error("--model-id requires --sample, --clip-id, or --manifest")
-    if args.sample_id and not args.bundle:
-        parser.error("--sample-id requires --bundle")
-    if args.sample is not None and args.bundle:
-        parser.error("--sample cannot be combined with --bundle")
-    if args.all_samples and (not args.bundle or args.sample_id):
-        parser.error("--all-samples requires --bundle and cannot be combined with --sample-id")
-    if (args.clip_id or args.manifest) and (args.sample_id or args.all_samples):
-        parser.error("--clip-id/--manifest cannot be combined with bundle sample selection")
     if args.sample_index is not None and not args.manifest:
         parser.error("--sample-index requires --manifest")
     if args.t0_us is not None and not args.clip_id:
         parser.error("--t0-us requires --clip-id; manifest examples already specify their time")
-    if args.nav_text is not None and not (args.clip_id or args.manifest):
-        parser.error("--nav-text requires --clip-id or --manifest")
     try:
         if args.manifest:
             clip = load_clip_manifest(args.manifest, args.sample_index or 0, args.nav_text)
-        elif args.clip_id:
+        else:
             clip = _clip_spec(
                 args.clip_id, 5_100_000 if args.t0_us is None else args.t0_us, args.nav_text
             )
@@ -324,21 +300,6 @@ def main(argv=None) -> None:
         max_generation_length=256,
         diffusion_kwargs={"inference_step": 10},
     )
-    if args.bundle:
-        manifest = json.loads((args.bundle / "manifest.json").read_text())
-        settings.update(
-            {key: value for key, value in manifest["inference"].items() if key in settings}
-        )
-        samples = []
-        if clip is None:
-            entries = {entry["id"]: args.bundle / entry["path"] for entry in manifest["samples"]}
-            ids = list(entries) if args.all_samples else args.sample_id or ["sample_000"]
-            unknown = set(ids) - entries.keys()
-            if unknown:
-                parser.error(f"Unknown sample IDs: {sorted(unknown)}")
-            samples = [entries[key] for key in ids]
-    else:
-        samples = [args.sample]
     for key in ("seed", "num_traj_sets", "num_traj_samples", "max_generation_length"):
         if getattr(args, key) is not None:
             settings[key] = getattr(args, key)
@@ -355,14 +316,12 @@ def main(argv=None) -> None:
     import transformers
 
     from alpamayo2_edge.checkpoint import load_model
+    from alpamayo2_edge.load_physical_aiavdataset import load_physical_aiavdataset
 
-    if clip is not None:
-        from alpamayo2_edge.load_physical_aiavdataset import load_physical_aiavdataset
-
-        data = load_physical_aiavdataset(**clip)
+    data = load_physical_aiavdataset(**clip)
 
     model, loading_info = load_model(
-        str(args.bundle or args.model_id),
+        args.model_id,
         device=args.device,
         dtype=args.dtype,
         attn_implementation=args.attn_implementation,
@@ -377,21 +336,13 @@ def main(argv=None) -> None:
         use_linear_patch_embedding(model)
     if args.accel != "off":
         from alpamayo2_edge.accel import AccelConfig, enable_acceleration
-        from alpamayo2_edge.sample import load_sample
 
         acceleration = enable_acceleration(
             model, AccelConfig(mode=args.accel, attention=args.accel_attention)
         )
-        first = data if clip is not None else load_sample(samples[0])
-        warm_up(model, first, settings, args.device, args.accel_warmup)
-    if clip is not None:
-        sample_id = f"{clip['clip_id']}_{clip['t0_us']}"
-        records = [run_data(model, data, sample_id, args.output / sample_id, settings, args.device)]
-    else:
-        records = [
-            run_sample(model, sample, args.output / sample.name, settings, args.device)
-            for sample in samples
-        ]
+        warm_up(model, data, settings, args.device, args.accel_warmup)
+    sample_id = f"{clip['clip_id']}_{clip['t0_us']}"
+    records = [run_data(model, data, sample_id, args.output / sample_id, settings, args.device)]
     report = {
         "model_path": model.config._name_or_path,
         "torch": torch.__version__,
@@ -412,12 +363,11 @@ def main(argv=None) -> None:
             "warmup_runs": args.accel_warmup,
             "flash_attn": _package_version("flash-attn"),
         }
-    if clip is not None:
-        from importlib.metadata import version
+    from importlib.metadata import version
 
-        report["dataset_runtime"] = {
-            name: version(name) for name in ("physical-ai-av", "av", "pandas", "pyarrow")
-        }
+    report["dataset_runtime"] = {
+        name: version(name) for name in ("physical-ai-av", "av", "pandas", "pyarrow")
+    }
     (args.output / "report.json").write_text(json.dumps(_json_value(report), indent=2) + "\n")
 
 
