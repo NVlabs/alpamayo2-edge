@@ -127,3 +127,32 @@ def test_clip_manifest_rejects_invalid_inputs_before_download(tmp_path, field, v
     path.write_text(json.dumps({"samples": [sample]}))
     with pytest.raises(ValueError, match=field):
         load_clip_manifest(path, 0)
+
+
+def _fake_cli_model(monkeypatch):
+    from types import SimpleNamespace
+
+    from alpamayo2_edge import checkpoint, inference
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "GPU")
+    model = SimpleNamespace(config=SimpleNamespace(_name_or_path="model"))
+    monkeypatch.setattr(checkpoint, "load_model", lambda *args, **kwargs: (model, {}))
+    monkeypatch.setattr(inference, "run_sample", lambda *args: {"finite": True})
+    return model
+
+
+def test_report_records_linear_patch_embedding(tmp_path, monkeypatch):
+    import json
+
+    from alpamayo2_edge import accel, inference
+
+    model = _fake_cli_model(monkeypatch)
+    calls = []
+    monkeypatch.setattr(accel, "use_linear_patch_embedding", calls.append)
+    args = ["--model-id", "model", "--sample", "sample_000", "--output", str(tmp_path)]
+    inference.main(args)
+    assert "patch_embedding" not in json.loads((tmp_path / "report.json").read_text())
+    inference.main([*args, "--patch-embed", "linear"])
+    assert json.loads((tmp_path / "report.json").read_text())["patch_embedding"] == "linear"
+    assert calls == [model]

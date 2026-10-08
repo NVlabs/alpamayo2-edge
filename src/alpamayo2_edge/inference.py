@@ -211,6 +211,13 @@ def main(argv=None) -> None:
     parser.add_argument("--max-generation-length", type=int)
     parser.add_argument("--diffusion-steps", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--patch-embed",
+        choices=["conv", "linear"],
+        default="conv",
+        help="Vision patch embedding: the checkpoint's Conv3d or the equivalent GEMM, which "
+        "avoids slow BF16 Conv3d kernels (e.g. PyTorch 2.9 on GB10)",
+    )
     args = parser.parse_args(argv)
     clip = None
     if args.model_id and not (args.sample or args.clip_id or args.manifest):
@@ -298,6 +305,10 @@ def main(argv=None) -> None:
         revision=args.revision,
         local_files_only=args.local_files_only,
     )
+    if args.patch_embed == "linear":
+        from alpamayo2_edge.accel import use_linear_patch_embedding
+
+        use_linear_patch_embedding(model)
     if clip is not None:
         sample_id = f"{clip['clip_id']}_{clip['t0_us']}"
         records = [run_data(model, data, sample_id, args.output / sample_id, settings, args.device)]
@@ -318,6 +329,8 @@ def main(argv=None) -> None:
         "loading_info": loading_info,
         "samples": records,
     }
+    if args.patch_embed != "conv":
+        report["patch_embedding"] = args.patch_embed
     if clip is not None:
         from importlib.metadata import version
 
