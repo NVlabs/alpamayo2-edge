@@ -5,7 +5,8 @@
 
 ``enable_acceleration`` installs ``torch.compile`` plus CUDA graphs on one loaded
 model: the vision tower, the prompt prefill, CoT decoding with a graphed sampler
-and the whole flow-matching loop. ``use_linear_patch_embedding`` computes the
+and the whole flow-matching loop. ``VisionFeatureCache`` reuses vision features
+across consecutive streaming calls, and ``use_linear_patch_embedding`` computes the
 patch embedding as a GEMM. Nothing here changes the default inference path.
 """
 
@@ -20,6 +21,7 @@ from alpamayo2_edge.accel.graphs import AccelStats
 from alpamayo2_edge.accel.kernels import ATTENTION_CHOICES, PARTS, resolve_kernels
 from alpamayo2_edge.accel.patch_embed import use_linear_patch_embedding
 from alpamayo2_edge.accel.vision import VisionAccelerator
+from alpamayo2_edge.accel.vit_cache import VisionFeatureCache, image_frame_ids
 
 MODES = ("compile", "tuned")
 # Inductor mode of the decode step; every other part uses the default mode.
@@ -172,7 +174,9 @@ __all__ = [
     "AccelConfig",
     "AccelHandle",
     "FlashKVCache",
+    "VisionFeatureCache",
     "enable_acceleration",
+    "image_frame_ids",
     "resolve_kernels",
     "use_linear_patch_embedding",
 ]

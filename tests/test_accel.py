@@ -1,5 +1,6 @@
 """Opt-in acceleration: exactness of the rewrites and parity with the eager model."""
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +9,9 @@ import torch
 from alpamayo2_edge.accel import (
     AccelConfig,
     FlashKVCache,
+    VisionFeatureCache,
     enable_acceleration,
+    image_frame_ids,
     resolve_kernels,
 )
 from alpamayo2_edge.accel import kernels as kernels_module
@@ -424,3 +427,132 @@ def _to_cuda(inputs):
     from alpamayo2_edge.helper import to_device
 
     return to_device(inputs, device="cuda")
+
+
+def _frame_stream(n_steps):
+    """Per-step frame IDs and patches, where each step drops the oldest frame per camera."""
+    generator = torch.Generator().manual_seed(7)
+    cameras = {0: (1, 4, 4), 1: (1, 4, 6)}
+    frames = {}
+
+    def frame(camera, step):
+        key = (camera, step * 100_000)
+        if key not in frames:
+            t, h, w = cameras[camera]
+            frames[key] = torch.randn(t * h * w, PATCH_DIM, generator=generator)
+        return key
+
+    steps = []
+    for step in range(n_steps):
+        ids = [frame(camera, step - offset) for camera in cameras for offset in (2, 1, 0)]
+        steps.append(ids)
+    return steps, frames, cameras
+
+
+def _packed(ids, frames, cameras):
+    grids = [cameras[camera] for camera, _ in ids]
+    return {
+        "tokenized_data": {
+            "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "pixel_values": torch.cat([frames[key] for key in ids]),
+            "image_grid_thw": torch.tensor(grids),
+        }
+    }
+
+
+def test_vit_cache_reuses_past_frame_features(monkeypatch):
+    model = _tiny_model(monkeypatch)
+    vlm_model = model.vlm.model
+    steps, frames, cameras = _frame_stream(4)
+    with torch.inference_mode():
+        expected = [
+            vlm_model.get_image_features(**_inputs(_packed(ids, frames, cameras))) for ids in steps
+        ]
+        cache = VisionFeatureCache(model)
+        for step, ids in enumerate(steps):
+            prepared = cache.prepare(_packed(ids, frames, cameras), ids)
+            encoded = prepared["tokenized_data"]["pixel_values"].shape[0]
+            assert encoded == (sum(16 + 24 for _ in range(3)) if step == 0 else 16 + 24)
+            actual = vlm_model.get_image_features(**_inputs(prepared))
+            # Images are encoded independently. Only CPU GEMM blocking, which depends
+            # on how many rows are encoded together, perturbs the last FP32 bit.
+            for got, want in zip(actual.pooler_output, expected[step].pooler_output, strict=True):
+                torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(
+                actual.deepstack_features[0],
+                expected[step].deepstack_features[0],
+                rtol=1e-6,
+                atol=1e-6,
+            )
+    assert cache.describe()["images_reused"] == 3 * 4
+    assert cache.describe()["images_encoded"] == 6 + 3 * 2
+
+
+def _inputs(batch):
+    data = batch["tokenized_data"]
+    return {"pixel_values": data["pixel_values"], "image_grid_thw": data["image_grid_thw"]}
+
+
+def test_vit_cache_keys_and_contract(monkeypatch):
+    model = _tiny_model(monkeypatch)
+    steps, frames, cameras = _frame_stream(1)
+    cache = VisionFeatureCache(model, max_images=4)
+    encode = model.vlm.model.get_image_features
+    batch = _packed(steps[0], frames, cameras)
+    altered = copy.deepcopy(batch)
+    altered["tokenized_data"]["pixel_values"] += 1
+    with torch.inference_mode():
+        encode(**_inputs(cache.prepare(batch, steps[0])))
+        # Same frame IDs with different pixels never reuse features.
+        prepared = cache.prepare(altered, steps[0])
+        assert prepared["tokenized_data"]["pixel_values"].shape == (120, PATCH_DIM)
+        encode(**_inputs(prepared))
+        assert len(cache.store) == 4
+        # The least recently used frames were evicted: two of six are encoded again.
+        prepared = cache.prepare(altered, steps[0])
+        assert prepared["tokenized_data"]["pixel_values"].shape[0] == 16 + 16
+        with pytest.raises(RuntimeError, match="prepare"):
+            encode(**_inputs(altered))
+        encode(**_inputs(altered))  # Without a plan, the call runs uncached.
+    assert cache.describe()["uncached_calls"] == 1
+    with pytest.raises(ValueError, match="frame IDs"):
+        cache.prepare(batch, steps[0][:-1])
+    cache.remove()
+    assert "forward" not in vars(model.vlm.model.visual)
+
+
+def test_image_frame_ids_follow_the_packed_image_order():
+    from alpamayo2_edge.sample import canonicalize_sample
+
+    counts = {0: 3, 1: 5, 2: 3, 3: 3, 5: 3, 6: 5}
+    cameras = torch.tensor([camera for camera, count in counts.items() for _ in range(count)])
+    order = torch.randperm(22, generator=torch.Generator().manual_seed(3))
+    times = (1_000_000 + torch.arange(22) * 33_333)[order]
+    sample = {
+        "image_frames": torch.zeros(22, 1, 3, 2, 2, dtype=torch.uint8),
+        "camera_indices": cameras[order],
+        "absolute_timestamps": times,
+        "ego_history_xyz": torch.zeros(1, 20, 3),
+        "ego_history_rot": torch.eye(3).expand(1, 20, 3, 3).clone(),
+        "nav_text": ["Continue straight"],
+    }
+    canonical = canonicalize_sample(sample)
+    assert image_frame_ids(sample) == list(
+        zip(canonical["camera_indices"].tolist(), canonical["absolute_timestamps"].tolist())
+    )
+
+
+def test_vit_cache_matches_uncached_trajectories(monkeypatch):
+    model = _tiny_model(monkeypatch)
+    inputs = _image_inputs()
+    ids = [(index % 2, index) for index in range(len(GRIDS))]
+    expected = _sample(model, inputs)
+    cache = VisionFeatureCache(model)
+    with torch.inference_mode():
+        # Encode every frame once, as earlier time steps of a stream would have.
+        model.vlm.model.get_image_features(**_inputs(cache.prepare(inputs, ids)))
+    prepared = cache.prepare(inputs, ids)
+    assert prepared["tokenized_data"]["pixel_values"].shape[0] == 0
+    actual = _sample(model, prepared)
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    assert torch.equal(actual[3]["generated_ids"], expected[3]["generated_ids"])
