@@ -13,25 +13,36 @@ activations.
 | --- | --- | --- | --- |
 | `torch.compile` + CUDA graphs | `--accel compile` or `--accel tuned` | `enable_acceleration(model, AccelConfig(...))` | Same model; fused kernels change BF16 rounding ([parity](validation.md#parity-on-h100)) |
 | Attention selection | `--accel-attention auto\|fa3\|sdpa` | `AccelConfig(attention=...)` | Kernel choice inside the graphs |
-| ViT feature cache | Python only | `VisionFeatureCache(model)` | Reuses identical per-frame features; needs consecutive frames |
+| ViT feature cache | Python only | `VisionFeatureCache(model)` | Reuses past frames' features; needs consecutive frames. Bitwise identical with eager vision; with the compiled vision graphs about 1–2 BF16 ulps, which changed 6% of greedy CoTs ([details](#vit-feature-cache)) |
 | GEMM patch embedding | `--patch-embed linear` | `use_linear_patch_embedding(model)` | Same math as the Conv3d, about 1 BF16 ulp apart |
+
+Apply the options in this order: the GEMM patch embedding, then acceleration,
+then the ViT cache. Each function raises if it is applied out of order, because
+captured graphs and cached features would keep the earlier computation.
 
 ## Requirements
 
 - A CUDA GPU and a BF16 model (`--dtype bfloat16`, the default).
 - FlashAttention 2 for the prefill, decode and expert graphs. The `flash` extra
   builds `flash-attn==2.8.3` from source; for the locked PyTorch 2.8 / CUDA 12
-  environment on x86_64, a prebuilt wheel installs in seconds:
+  environment on x86_64, the prebuilt release wheel installs in seconds. Pin it
+  by hash:
 
   ```bash
-  uv pip install --no-deps \
-      "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+  echo "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl --hash=sha256:f25da18657a87fc83dc1bfb8b7751b82246e9db355510226b674fd437c34b5fb" > flash-attn.txt
+  uv pip install --no-deps --require-hashes -r flash-attn.txt
   ```
 
   The wheel needs glibc 2.32 or newer (for example Ubuntu 22.04); on older
-  systems, build the `flash` extra from source instead. Without an importable
-  `flash_attn`, only the vision tower is accelerated; `report.json` lists the
-  skipped parts and the reason.
+  systems, build the `flash` extra from source instead. `uv sync` removes
+  packages that are not in `uv.lock`, including this wheel: add `--inexact` to
+  later syncs (for example `uv sync --locked --inexact --extra dataset --dev`),
+  or reinstall the wheel afterwards.
+- Without an importable `flash_attn`, only the vision tower can be accelerated.
+  `--accel` then stops with an error before loading the model, and
+  `--accel-allow-partial` accepts vision-only acceleration. In Python,
+  `enable_acceleration` emits a `RuntimeWarning`; `handle.skipped` and
+  `report.json` list the parts that stay eager and why.
 - FlashAttention 3 is optional and Hopper-only (`flash_attn_interface`, built
   from the FlashAttention `hopper/` directory). With `--accel-attention auto` it
   is used for the vision tower and prompt prefill on sm_90 when importable.
@@ -67,7 +78,7 @@ accel = enable_acceleration(model, AccelConfig(mode="tuned"))
 accel.warmup(inputs)  # optional: build the graphs for one prepared input
 # ... model.sample_trajectories_from_data(...) as before ...
 print(accel.describe())  # parts, kernels, graph builds, fallbacks
-accel.remove()           # restore the original methods
+accel.remove()  # restore the original methods
 ```
 
 ## What is accelerated
@@ -91,14 +102,15 @@ Calls outside this envelope run the original eager code, counted under
 | Situation | Graphed parts |
 | --- | --- |
 | One CoT (the CLI default, `1 x 1`) | All four |
-| Several CoTs (`num_traj_sets * num_traj_samples > 1`) | Vision and decode; prefill runs eagerly into the static cache; the expert is graphed only when all CoTs have the same length |
-| Left-padded batches, text-only or video inputs | None (eager) |
-| Other logits processors, stopping criteria or streamers | Decode step only, inside HF's sampling loop |
+| Several CoTs (`num_traj_sets * num_traj_samples > 1`) | Vision and decode. The prefill always runs eagerly into the static cache. The expert graph replays only when all CoTs have the same length; otherwise the expert runs eagerly |
+| Left-padded batches and video inputs | Vision tower only |
+| Text-only inputs | None |
+| Other logits processors, stopping criteria or streamers | All four, but sampling runs in HF's eager loop around the graphed decoder step |
 
 ## Compilation, shapes and memory
 
 Each new input shape compiles and captures its graphs inline, so the first call
-is slow. On an H100, the eight graphs for one and six CoTs took 123 s to build
+is slow. On an H100, the eight graphs for one and six CoTs took 121 s to build
 with `--accel compile` and 170 s with `--accel tuned` from an empty compiler
 cache, and the first one-CoT call alone took about 110 s. With a populated cache,
 building six of these graphs took 23 s. Inductor and Triton cache compiled
@@ -109,13 +121,38 @@ machines with the same GPU.
 Graphs have static shapes. A new image resolution or camera set, a prompt that
 crosses a 256-token bucket, a different number of CoTs, a different
 `max_generation_length`, different sampling settings, or a different number of
-diffusion steps builds new graphs on first use. Graphs and their static buffers
-stay allocated for the process lifetime. On the H100, peak allocated memory grew
-from 5.6 to 5.9 GB for one CoT and from 8.6 to 8.8 GB for six CoTs.
+diffusion steps builds new graphs on first use. Two builds depend on the data
+rather than on the input shape:
+
+- **Several CoTs.** The expert graph replays only when all CoTs have the same
+  length. It is captured on the first call with that shape, normally the
+  warm-up, even though that call's CoTs usually differ in length and run the
+  expert eagerly. A later call whose CoTs happen to end together therefore
+  replays the graph instead of compiling for 17–20 s mid-stream.
+- **ViT cache.** Vision graphs are keyed by patch grid and image count. During
+  the first two seconds of a stream, the number of new frames per patch grid
+  falls step by step, from all 22 frames to the newest frame of each camera.
+  For a 10 Hz stream with this camera profile, that builds up to six vision
+  graphs beyond the full-frame ones, 11–13 s each in our runs. To keep these
+  builds out of live operation, run the first two seconds of a recorded stream
+  through the cache, then `clear()` it, or reuse a populated compiler cache.
+
+Graphs, their static input buffers and each graph's private memory pool stay
+allocated while acceleration is installed, and the static KV cache (about
+0.4 GB per CoT) persists between calls. On the H100, peak allocated memory grew
+from 5.6 to 5.9 GB for one CoT and from 8.6 to 8.8 GB for six CoTs; see
+[validation](validation.md#latency-on-h100) for reserved memory.
 
 Accelerated outputs are not bitwise identical to eager outputs. Compiled kernels
 fuse operations and change BF16 rounding, which can flip the sampled token where
 two candidates are nearly tied; the CoT then continues differently.
+
+Compiled kernels are selected when they are compiled, partly by benchmarking
+candidates, and `--accel tuned` also autotunes the decode step. Two processes can
+therefore select different kernels, for example when graphs are built in a
+different order, and produce outputs that differ in the last bits. Reusing the
+compiler cache reproduces the selection. In our runs, the same code and build
+order reproduced outputs bit for bit across processes and nodes.
 
 ## ViT feature cache
 
@@ -140,11 +177,21 @@ for sample in stream:  # consecutive time steps of one drive
 cache.clear()  # at the end of a stream
 ```
 
-- `prepare` must run on the inputs of every call; it removes the cached frames'
-  patches, so only new frames are uploaded and encoded.
-- A frame is identified by `(camera, capture time)`, its patch grid and a
-  fingerprint of sampled pixel rows. Pass `full_digest=True` to hash every pixel
-  (about 2 ms of CPU time per image).
+- `prepare` must run on the inputs of every call. It removes the cached
+  frames' patches, so only new frames are uploaded and encoded. It runs on the
+  CPU and took about 3 ms per call in steady state on a loaded 16-core host.
+- Frame IDs must be unique within one cache. `image_frame_ids` returns
+  `(stream, camera, capture time)`, where `stream` is the sample's `clip_id`
+  (PhysicalAI-AV samples carry one) or the `stream` argument. Name the stream
+  when timestamps can repeat across the samples that share a cache, for example
+  clip-relative times of local samples, or call `clear()` between streams.
+- A cached feature is reused only when the frame ID, the patch grid and a
+  fingerprint of the pixels all match. The fingerprint is a 128-bit hash of
+  about 16 values of every patch: a safeguard against reused IDs, not a proof
+  of identity. Pass `full_digest=True` to hash every pixel (about 2 ms of CPU
+  time per image).
+- The cache does not track the model. Call `clear()` after changing weights,
+  the patch embedding or the acceleration settings.
 - It only helps when calls see the same frames again: each camera's frames must
   stay in the cache from capture until their oldest offset (2 s for the front
   cameras). `max_images` (default 256, at most about 0.75 GB) bounds the cache
@@ -154,8 +201,8 @@ cache.clear()  # at the end of a stream
   together can differ in the last bit. With the compiled vision graphs, a frame
   encoded in a smaller batch can differ by one or two BF16 ulps.
 - On an H100 in streaming steady state, encoding the six newest frames instead
-  of all 22 saved 33 ms per call in eager mode and 13 ms with the compiled
-  graphs.
+  of all 22 saved 33 ms per model call in eager mode and 13 ms with the
+  compiled graphs, not counting `prepare`.
 
 ## GEMM patch embedding
 

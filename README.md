@@ -257,11 +257,11 @@ used to rank candidates. The CLI checks trajectory shapes and finite values.
 
 Opt-in BF16 speedups in `alpamayo2_edge.accel` keep the model and its sampling
 semantics and change only how the GPU executes them. The defaults are unchanged,
-and nothing is quantized. On an H100, `--accel tuned` ran one CoT and its
-trajectory in 128 ms instead of 945 ms (7.4x), and in 115 ms with the ViT cache
-in streaming use; six CoTs took 484 ms instead of 1,080 ms. Install
-FlashAttention 2 first ([details](docs/acceleration.md#requirements)), then add
-`--accel tuned`:
+and nothing is quantized. On an H100, with `--accel tuned`, the model call (inputs
+already on the GPU, preprocessing excluded) took 127 ms instead of 952 ms for one
+CoT and its trajectory (7.5x), and 115 ms with the ViT cache in streaming use;
+six CoTs took 488 ms instead of 1,099 ms. Install FlashAttention 2 first
+([details](docs/acceleration.md#requirements)), then add `--accel tuned`:
 
 ```bash
 python -m alpamayo2_edge.inference \
@@ -275,7 +275,8 @@ python -m alpamayo2_edge.inference \
   CoT decoding (including sampling) and the flow-matching loop with
   `torch.compile` and CUDA graphs. `tuned` also autotunes the decode step. The
   first input compiles and captures the graphs; later inputs with the same
-  shapes replay them.
+  shapes replay them. Without FlashAttention 2, `--accel` stops with an error;
+  `--accel-allow-partial` accelerates the vision tower only.
 - `--accel-attention` selects the attention kernel inside the vision and
   prefill graphs. The default `auto` uses FlashAttention 3 on Hopper when it is
   installed, otherwise PyTorch SDPA.
@@ -288,19 +289,30 @@ python -m alpamayo2_edge.inference \
 Caveats:
 
 - The first call for each new input shape compiles and captures graphs inline:
-  2–3 minutes from an empty compiler cache on an H100, about 23 s with a
-  populated one. Set `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` to keep the
-  cache across processes.
+  about 2 minutes for the first one-CoT call from an empty compiler cache on an
+  H100, much less with a populated one (six graphs in 23 s). Set
+  `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` to keep the cache across
+  processes.
 - Graph shapes are static. A new image resolution, a prompt that crosses a
   256-token bucket, or a different CoT count, generation length or sampling
-  setting builds new graphs on first use.
-- With several CoTs, only vision and decoding are graphed; six CoTs ran 2.2x
-  faster rather than 7.4x.
+  setting builds new graphs on first use. With the ViT cache, the first two
+  seconds of a stream also build up to six extra vision graphs (11–13 s each);
+  [warm up](docs/acceleration.md#compilation-shapes-and-memory) with a recorded
+  stream to keep them out of live operation.
+- With several CoTs, the prefill runs eagerly and the expert graph replays only
+  when all CoTs have the same length, so six CoTs ran 2.3x faster rather than
+  7.5x.
 - The ViT cache helps only for consecutive time steps of one stream. Call
-  `clear()` when the stream changes.
+  `clear()` when the stream changes and after changing the model.
 - Accelerated outputs are not bitwise identical to the default path: compiled
   kernels round BF16 differently, which can change a sampled token where two
-  candidates are nearly tied.
+  candidates are nearly tied. On 33 samples, every minADE difference had a 95%
+  interval that included zero. The 2,643-sample evaluation of an earlier
+  prototype covers `--accel tuned` with FlashAttention 3 (no measurable change).
+  In that evaluation, `compile` with SDPA attention changed greedy minADE by a
+  small but significant +0.2%. The SDPA configurations that the release
+  environment uses are covered only by the 33-sample check
+  ([details](docs/validation.md#inference-acceleration)).
 
 The [acceleration guide](docs/acceleration.md) covers requirements, the Python
 API, which calls are graphed and the ViT cache. [Validation
