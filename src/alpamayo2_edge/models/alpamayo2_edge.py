@@ -160,6 +160,45 @@ class Alpamayo2Edge(PreTrainedModel):
         outputs.rope_deltas = rope_deltas
         return outputs
 
+    def _sample_actions(
+        self,
+        cache: Any,
+        prefix_length: int,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        expert_batch: int,
+        device: torch.device,
+        diffusion_kwargs: dict[str, Any] | None,
+    ) -> torch.Tensor:
+        """Denoise expert actions conditioned on the VLM cache cropped to ``prefix_length``."""
+        action_dims = self.expert.action_space.get_action_space_dims()
+
+        # SDPA/eager require the caller's explicit 4D noncausal mask: is_causal
+        # alone would leave HF's upstream causal-mask construction in effect.
+        def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            embeddings = self.expert.action_in_proj(x, t).reshape(expert_batch, action_dims[0], -1)
+            try:
+                outputs = self.expert.expert(
+                    inputs_embeds=embeddings,
+                    position_ids=position_ids,
+                    past_key_values=cache,
+                    attention_mask=attention_mask,
+                    use_cache=True,
+                    is_causal=False,
+                )
+            finally:
+                # Each diffusion step conditions on the original CoT only.
+                cache.crop(prefix_length)
+            return self.expert.action_out_proj(outputs.last_hidden_state).reshape(-1, *action_dims)
+
+        return self.expert.diffusion.sample(
+            batch_size=expert_batch,
+            step_fn=step_fn,
+            device=device,
+            return_all_steps=False,
+            **(diffusion_kwargs or {}),
+        )
+
     @torch.inference_mode()
     def sample_trajectories_from_data(
         self,
@@ -308,31 +347,14 @@ class Alpamayo2Edge(PreTrainedModel):
         if implementation == "flash_attention_2":
             # FA2 takes a padding mask; is_causal=False controls its kernel.
             attention_mask = attention_mask[:, 0, 0].eq(0).to(prefix_mask.dtype)
-
-        # SDPA/eager require the explicit 4D noncausal mask above: is_causal
-        # alone would leave HF's upstream causal-mask construction in effect.
-        def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            embeddings = self.expert.action_in_proj(x, t).reshape(expert_batch, action_dims[0], -1)
-            try:
-                outputs = self.expert.expert(
-                    inputs_embeds=embeddings,
-                    position_ids=position_ids,
-                    past_key_values=cache,
-                    attention_mask=attention_mask,
-                    use_cache=True,
-                    is_causal=False,
-                )
-            finally:
-                # Each diffusion step conditions on the original CoT only.
-                cache.crop(prefix_length)
-            return self.expert.action_out_proj(outputs.last_hidden_state).reshape(-1, *action_dims)
-
-        sampled_action = self.expert.diffusion.sample(
-            batch_size=expert_batch,
-            step_fn=step_fn,
-            device=input_ids.device,
-            return_all_steps=False,
-            **(diffusion_kwargs or {}),
+        sampled_action = self._sample_actions(
+            cache,
+            prefix_length,
+            position_ids,
+            attention_mask,
+            expert_batch,
+            input_ids.device,
+            diffusion_kwargs,
         )
         pred_xyz, pred_rot = self.expert.action_space.action_to_traj(
             sampled_action,

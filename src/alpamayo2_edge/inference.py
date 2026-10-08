@@ -35,6 +35,32 @@ def _json_value(value):
     return value
 
 
+def predict(model, prepared: dict, settings: dict, device: str) -> tuple:
+    """Seed text and diffusion sampling, then run the model on prepared inputs."""
+    torch.manual_seed(settings["seed"])
+    generator = torch.Generator(device=device).manual_seed(settings["seed"])
+    with (
+        torch.inference_mode(),
+        torch.autocast(
+            device_type=torch.device(device).type,
+            dtype=model.dtype,
+            enabled=model.dtype != torch.float32,
+        ),
+    ):
+        xyz, rot, _, extra = model.sample_trajectories_from_data(
+            prepared,
+            num_traj_sets=settings["num_traj_sets"],
+            num_traj_samples=settings["num_traj_samples"],
+            top_p=settings["top_p"],
+            top_k=settings["top_k"],
+            temperature=settings["temperature"],
+            max_generation_length=settings["max_generation_length"],
+            diffusion_kwargs={**settings["diffusion_kwargs"], "generator": generator},
+            return_extra=True,
+        )
+    return xyz, rot, extra
+
+
 def run_sample(model, sample_path: Path, output: Path, settings: dict, device: str) -> dict:
     from alpamayo2_edge.sample import load_sample
 
@@ -69,27 +95,7 @@ def run_data(model, data: dict, sample_id: str, output: Path, settings: dict, de
         {f"traj_data.{key}": value.cpu().contiguous() for key, value in histories.items()}
     )
     prepared = to_device(prepared, device=device)
-    torch.manual_seed(settings["seed"])
-    generator = torch.Generator(device=device).manual_seed(settings["seed"])
-    with (
-        torch.inference_mode(),
-        torch.autocast(
-            device_type=torch.device(device).type,
-            dtype=model.dtype,
-            enabled=model.dtype != torch.float32,
-        ),
-    ):
-        xyz, rot, _, extra = model.sample_trajectories_from_data(
-            prepared,
-            num_traj_sets=settings["num_traj_sets"],
-            num_traj_samples=settings["num_traj_samples"],
-            top_p=settings["top_p"],
-            top_k=settings["top_k"],
-            temperature=settings["temperature"],
-            max_generation_length=settings["max_generation_length"],
-            diffusion_kwargs={**settings["diffusion_kwargs"], "generator": generator},
-            return_extra=True,
-        )
+    xyz, rot, extra = predict(model, prepared, settings, device)
     validate_predictions(xyz, rot, settings["num_traj_sets"], settings["num_traj_samples"])
     if torch.device(device).type == "cuda":
         torch.cuda.synchronize(device)
