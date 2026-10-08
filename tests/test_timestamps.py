@@ -1,15 +1,12 @@
 """Regressions for capture-time precision and its connection to image tokens."""
 
-import json
-import os
 import re
-from pathlib import Path
 
-import pytest
 import torch
-from test_inputs import raw_sample
+from test_inputs import config, raw_sample
 
 from alpamayo2_edge.chat_template import relative_time_labels
+from alpamayo2_edge.helper import create_messages
 from alpamayo2_edge.sample import canonicalize_sample
 
 
@@ -53,57 +50,30 @@ def test_reference_is_latest_last_camera_capture_even_if_another_camera_is_later
     assert canonical["image_frames"][-1, 0, 0, 0, 0].item() == 21
 
 
-@pytest.mark.skipif(
-    not os.environ.get("ALPAMAYO2_EDGE_TEST_BUNDLE"),
-    reason="Set ALPAMAYO2_EDGE_TEST_BUNDLE to exercise actual checkpoint tokenization",
-)
-def test_capture_time_changes_reach_input_ids_and_images_follow_reordered_times():
-    from transformers import AutoTokenizer
+def test_capture_time_changes_reach_prompt_and_images_follow_reordered_times():
+    raw = raw_sample()
+    raw["image_frames"][:, 0, 0, 0, 0] = torch.arange(22, dtype=torch.uint8)
 
-    from alpamayo2_edge.config import Alpamayo2EdgeConfig, normalize_checkpoint_config
-    from alpamayo2_edge.helper import prepare_model_inputs
-    from alpamayo2_edge.sample import load_sample
+    def prompt_labels_and_images(data):
+        content = create_messages(data, config())[1]["content"]
+        text = "".join(entry["text"] for entry in content if entry["type"] == "text")
+        images = torch.stack([entry["image"] for entry in content if entry["type"] == "image"])
+        return re.findall(r"<t=[^>]+>", text), images
 
-    bundle = Path(os.environ["ALPAMAYO2_EDGE_TEST_BUNDLE"]).resolve()
-    cfg = Alpamayo2EdgeConfig(
-        **normalize_checkpoint_config(json.loads((bundle / "model/config.json").read_text()))
-    )
-    cfg._name_or_path = str(bundle / "model")
-    tokenizer = AutoTokenizer.from_pretrained(bundle / "model")
-    raw = load_sample(bundle / "samples/sample_000")
-    canonical = canonicalize_sample(raw)
-    baseline = prepare_model_inputs(canonical, cfg, tokenizer)["tokenized_data"]
-
-    def decoded_labels(packed):
-        text = tokenizer.decode(packed["input_ids"][0], skip_special_tokens=False)
-        return re.findall(r"<t=[^>]+>", text)
-
-    baseline_labels = decoded_labels(baseline)
-    changed = dict(canonical, absolute_timestamps=canonical["absolute_timestamps"].clone())
+    baseline_labels, baseline_images = prompt_labels_and_images(raw)
+    changed = dict(raw, absolute_timestamps=raw["absolute_timestamps"].clone())
     changed["absolute_timestamps"][0] -= 160_000
-    perturbed = prepare_model_inputs(changed, cfg, tokenizer)["tokenized_data"]
-    perturbed_labels = decoded_labels(perturbed)
+    perturbed_labels, perturbed_images = prompt_labels_and_images(changed)
     assert baseline_labels[0] != perturbed_labels[0]
     assert baseline_labels[1:] == perturbed_labels[1:]
-    assert not torch.equal(baseline["input_ids"], perturbed["input_ids"])
-    assert torch.equal(baseline["pixel_values"], perturbed["pixel_values"])
-    assert torch.equal(baseline["image_grid_thw"], perturbed["image_grid_thw"])
-    assert torch.equal(baseline["mm_token_type_ids"], perturbed["mm_token_type_ids"])
+    assert torch.equal(baseline_images, perturbed_images)
 
-    # Move that same image after the other two captures of camera 0. The actual
-    # processor's image patches must follow the corresponding timestamp label.
-    changed["absolute_timestamps"][0] = canonical["absolute_timestamps"][2] + 200_000
-    reordered = prepare_model_inputs(changed, cfg, tokenizer)["tokenized_data"]
-    reordered_labels = decoded_labels(reordered)
+    # Move that same image after the other two captures of camera 0. The prompt
+    # must keep each image aligned with its corresponding timestamp label.
+    changed["absolute_timestamps"][0] = raw["absolute_timestamps"][2] + 200_000
+    reordered_labels, reordered_images = prompt_labels_and_images(changed)
     assert reordered_labels[:2] == baseline_labels[1:3]
     assert reordered_labels[2] != baseline_labels[0]
     assert reordered_labels[3:] == baseline_labels[3:]
-    baseline_chunks = baseline["pixel_values"].split(
-        baseline["image_grid_thw"].prod(dim=1).tolist()
-    )
-    reordered_chunks = reordered["pixel_values"].split(
-        reordered["image_grid_thw"].prod(dim=1).tolist()
-    )
     expected_order = [1, 2, 0, *range(3, 22)]
-    for actual, source_index in zip(reordered_chunks, expected_order, strict=True):
-        assert torch.equal(actual, baseline_chunks[source_index])
+    assert torch.equal(reordered_images, baseline_images[expected_order])

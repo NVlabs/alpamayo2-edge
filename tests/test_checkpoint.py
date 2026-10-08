@@ -16,8 +16,8 @@ def model_layout(path: Path):
     return path
 
 
-def test_resolves_model_and_bundle_without_network(tmp_path):
-    model = model_layout(tmp_path / "bundle" / "model")
+def test_resolves_model_directory_and_its_parent_without_network(tmp_path):
+    model = model_layout(tmp_path / "checkpoint" / "model")
     assert resolve_checkpoint(str(model)) == model
     assert resolve_checkpoint(str(model.parent)) == model
 

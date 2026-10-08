@@ -12,8 +12,8 @@ Early-access weights are hosted at
 [nvidia/EA-Alpamayo2-Edge](https://huggingface.co/nvidia/EA-Alpamayo2-Edge).
 Model access requires an authorized Hugging Face account. The model files are at
 the repository root; no `--subfolder` is needed. Load example clips directly from
-PhysicalAI-AV or provide your own raw samples. This implementation supports the
-above linked checkpoint and its 22-image, 20-pose input profile.
+PhysicalAI-AV. This implementation supports the above linked checkpoint and its
+22-image, 20-pose input profile.
 
 ## Setup
 
@@ -114,7 +114,7 @@ export EDGE_MODEL="$PWD/.work/EA-Alpamayo2-Edge"
 and processor assets from that directory, without fetching a separate backbone.
 The EA configuration uses the standalone `alpamayo2_edge` model identifiers.
 
-## Sampling settings and local inputs
+## Sampling settings
 
 Run the public navigation example using the downloaded model:
 
@@ -143,24 +143,10 @@ python -m alpamayo2_edge.inference \
     --output outputs/six-independent-trajectories
 ```
 
-Use a standalone local model directory with your own raw sample directory:
-
-```bash
-python -m alpamayo2_edge.inference \
-    --model-id "$EDGE_MODEL" \
-    --sample /path/to/raw-sample \
-    --num-traj-sets 6 --num-traj-samples 1 \
-    --output outputs/local-sample
-```
-
 `--model-id` accepts either a local directory or a Hugging Face repository ID.
 Use `--revision` to select an immutable HF snapshot. Other options include
 `--seed`, `--diffusion-steps`,
 `--max-generation-length`, `--device`, and `--dtype`; see `--help`.
-
-For existing local test bundles, `--bundle /path/to/bundle` still reads the bundle's
-sampling settings and examples. `--all-samples` or repeatable `--sample-id` flags
-select those examples. The EA model repository itself is model-only.
 
 Each sample's output directory contains `output.safetensors` with `pred_xyz`,
 `pred_rot`, and generated token IDs; `output.json` with decoded text and shape
@@ -170,23 +156,23 @@ backend, sampling settings, and checkpoint loading diagnostics. With
 `--num-traj-sets 6 --num-traj-samples 1`, positions have shape `[1, 6, 1, 64, 3]`
 and rotations have shape `[1, 6, 1, 64, 3, 3]`.
 
-## Raw sample contract
+## Dataset input profile
 
-A sample directory contains `sample.json` and `tensors.safetensors`
-(`input.safetensors` is also accepted). Store these five tensors:
+`load_physical_aiavdataset` returns an in-memory dictionary for
+`prepare_model_inputs`, including these tensors:
 
 | Field | Dtype | Shape | Meaning |
 | --- | --- | --- | --- |
 | `image_frames` | `uint8` | `[22, 1, 3, H, W]` | Contiguous CPU RGB images; the public example uses 1080 × 1920. |
 | `camera_indices` | `int64` | `[22]` | Camera ID for each image. |
-| `absolute_timestamps` | `int64` | `[22]` or `[22, 1]` | Captured image timestamps in microseconds. |
+| `absolute_timestamps` | `int64` | `[22]` or `[22, 1]` | Captured image timestamps in clip-relative microseconds. |
 | `ego_history_xyz` | Floating point | `[1, 20, 3]` | Twenty finite ego positions. |
 | `ego_history_rot` | Floating point | `[1, 20, 3, 3]` | Corresponding finite rotation matrices. |
 
-History poses span −1.9 through 0 seconds at 0.1-second intervals and produce 57
-delta tokens; they must already use the checkpoint's ego-history coordinate
-convention. Adding a leading batch dimension to either history tensor is accepted.
-Inference requires exactly the following camera counts and sampling profile:
+The loader transforms history poses into the ego frame at `t0`. They span −1.9
+through 0 seconds at 0.1-second intervals and produce 57 delta tokens.
+`prepare_model_inputs` adds the model's leading batch dimension. The loader uses
+the following camera counts and sampling profile:
 
 | Cameras | Images per camera | Intended image offsets (seconds) | Pixel budget (min–max) |
 | --- | --- | --- | --- |
@@ -198,12 +184,10 @@ camera and timestamp together, renders relative-time labels, resizes in `uint8`
 with bicubic interpolation, and applies the checkpoint's normalization. Frame
 ordering, timestamps, and per-camera pixel budgets are part of the model input.
 
-`sample.json` must include nonempty navigation text as a one-element list, for
-example `{"nav_text": ["Continue straight"]}`. The optional
-`camera_pixel_bounds` object maps camera IDs to `[min_pixels, max_pixels]`; the
-table's defaults apply when omitted. Bundled metadata also records
-`history_num_steps=20` and source provenance. Future trajectory labels are stored
-separately and are not needed for inference.
+The dictionary also contains the supplied navigation instruction in `nav_text`
+as a one-element list, the per-camera `camera_pixel_bounds`, and source provenance.
+The loader requires an explicit, nonempty navigation instruction and does not
+load future trajectory labels.
 
 ## Python API
 
@@ -212,10 +196,14 @@ import torch
 
 from alpamayo2_edge.checkpoint import load_model
 from alpamayo2_edge.helper import prepare_model_inputs, to_device
-from alpamayo2_edge.sample import load_sample
+from alpamayo2_edge.load_physical_aiavdataset import load_physical_aiavdataset
 
+sample = load_physical_aiavdataset(
+    "ea7bbd31-b7a5-4972-8dbd-7089e6b53de4",
+    t0_us=4_000_000,
+    nav_text="Turn right in 30m",
+)
 model, loading_info = load_model("nvidia/EA-Alpamayo2-Edge", device="cuda")
-sample = load_sample("/path/to/sample_000")
 inputs = to_device(prepare_model_inputs(sample, model.config, model.tokenizer), device="cuda")
 torch.manual_seed(43)
 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -232,22 +220,10 @@ with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
     )
 ```
 
-To source the same raw input dictionary from a public clip, replace `load_sample`
-with:
-
-```python
-from alpamayo2_edge.load_physical_aiavdataset import load_physical_aiavdataset
-
-sample = load_physical_aiavdataset(
-    "ea7bbd31-b7a5-4972-8dbd-7089e6b53de4",
-    t0_us=4_000_000,
-    nav_text="Turn right in 30m",
-)
-```
-
-The subsequent `prepare_model_inputs` and model calls stay the same. An optional
-`avdi` argument accepts an existing `PhysicalAIAVDatasetInterface`, allowing a
-chosen dataset revision/cache to be reused across multiple clips.
+This uses the dataset extra and Hugging Face access described above. An optional
+`avdi` argument to `load_physical_aiavdataset` accepts an existing
+`PhysicalAIAVDatasetInterface`, allowing a chosen dataset revision/cache to be
+reused across multiple clips. `load_model` also accepts a local model directory.
 
 `load_model` rejects missing, unexpected, or mismatched checkpoint parameters.
 The third model return value is a placeholder log probability and should not be
@@ -320,10 +296,9 @@ results](docs/validation.md#inference-acceleration) list the measured latency
 and parity.
 
 For development, run `uv run --locked pytest`. See
-[validation results and reproduction commands](docs/validation.md) for measured
-checkpoint loading, preprocessing, and GPU inference results, including remaining
-differences from the original checkpoint's reference outputs. Inference components
-are adapted from
+[validation results and reproduction commands](docs/validation.md) for the
+recorded EA checkpoint download and PhysicalAI-AV GPU inference checks.
+Inference components are adapted from
 [Alpamayo 2 Super, commit 5e7975f](https://github.com/NVlabs/alpamayo2/tree/5e7975f4a2100ee8ac1a62b79239bbabefddcbef).
 Source code is distributed under [Apache-2.0](LICENSE); checkpoint access and its
 model-card terms are separate.

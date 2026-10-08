@@ -40,7 +40,7 @@ def resolve_checkpoint(
     cache_dir: str | None = None,
     local_files_only: bool = False,
 ) -> Path:
-    """Accept a model directory, a bundle containing model/, or a HF repository."""
+    """Accept a model directory, its parent containing model/, or a HF repository."""
     path = Path(model_id).expanduser()
     if path.exists():
         path = path / subfolder
