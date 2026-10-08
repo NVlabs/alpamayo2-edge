@@ -250,6 +250,12 @@ def main(argv=None) -> None:
         help="Untimed runs of the first input that compile and capture graphs (with --accel)",
     )
     parser.add_argument(
+        "--accel-allow-partial",
+        action="store_true",
+        help="With --accel, continue when flash-attn is missing: only the vision tower is "
+        "accelerated (otherwise this is an error)",
+    )
+    parser.add_argument(
         "--patch-embed",
         choices=["conv", "linear"],
         default="conv",
@@ -293,6 +299,21 @@ def main(argv=None) -> None:
         parser.error("--accel requires a CUDA --device and --dtype bfloat16")
     if args.accel_warmup < 0:
         parser.error("--accel-warmup must be nonnegative")
+    if args.accel_allow_partial and args.accel == "off":
+        parser.error("--accel-allow-partial requires --accel")
+    if args.accel != "off":
+        from alpamayo2_edge.accel import resolve_kernels
+
+        try:
+            kernels = resolve_kernels(args.accel_attention, args.device)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if kernels["decode"] is None and not args.accel_allow_partial:
+            parser.error(
+                "--accel needs an importable flash_attn (FlashAttention 2) for the prefill, "
+                "decode and expert graphs; without it only the vision tower is accelerated. "
+                "Install it (see docs/acceleration.md#requirements) or pass --accel-allow-partial."
+            )
     settings = dict(
         seed=43,
         top_p=0.98,

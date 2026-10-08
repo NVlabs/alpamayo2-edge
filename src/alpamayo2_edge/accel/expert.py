@@ -11,6 +11,10 @@ one replay. Eager attention instead re-concatenates the prompt cache on every st
 (in FP32, because the expert's residual stream is FP32 under BF16 autocast) and
 expands the KV heads for SDPA. The initial noise is drawn eagerly from the call's
 generator, exactly as ``FlowMatching._euler`` draws it.
+
+Several CoTs replay the graph only when they all have the same length; otherwise
+the eager loop runs. The graph is still captured on the first call with that
+shape, normally the warm-up, so that the first equal-length call does not stall.
 """
 
 from typing import Any
@@ -85,9 +89,6 @@ class ExpertAccelerator:
         kwargs = diffusion_kwargs or {}
         if not isinstance(cache, FlashKVCache):
             return "expert_without_flash_cache"
-        if _mask_hides_tokens(attention_mask):
-            # Several CoTs of different lengths, or prompt padding.
-            return "expert_mask"
         if (
             type(diffusion) is not FlowMatching
             or set(kwargs) - _LOOP_KWARGS
@@ -95,6 +96,9 @@ class ExpertAccelerator:
             or diffusion.use_classifier_free_guidance
         ):
             return "expert_sampler"
+        if _mask_hides_tokens(attention_mask):
+            # Several CoTs of different lengths.
+            return "expert_mask"
         return None
 
     def sample_actions(
@@ -109,6 +113,11 @@ class ExpertAccelerator:
     ) -> torch.Tensor:
         """``Alpamayo2Edge._sample_actions`` with the whole Euler loop graphed."""
         reason = self._unsupported(cache, attention_mask, diffusion_kwargs)
+        kwargs = diffusion_kwargs or {}
+        if reason == "expert_mask":
+            # Capture now with placeholder noise (no random draw); the eager loop
+            # below rewrites the cache columns the capture wrote.
+            self._graph(cache, prefix_length, position_ids, expert_batch, device, kwargs, None)
         if reason is not None:
             self.stats.fallback(reason)
             return self.original(
@@ -120,30 +129,38 @@ class ExpertAccelerator:
                 device,
                 diffusion_kwargs,
             )
-        kwargs = diffusion_kwargs or {}
-        diffusion = self.expert.diffusion
-        dims = tuple(diffusion.x_dims)
-        steps = kwargs.get("inference_step") or diffusion.num_inference_steps
+        dims = tuple(self.expert.diffusion.x_dims)
         noise = torch.randn(expert_batch, *dims, device=device, generator=kwargs.get("generator"))
         noise = noise * kwargs.get("temperature", 1.0)
-        autocast = autocast_state(noise.device.type)
-        if autocast not in self.embed_dtypes:
-            probe_t = torch.zeros(1, *[1] * len(dims), device=device)
-            self.embed_dtypes[autocast] = self.expert.action_in_proj(noise[:1], probe_t).dtype
-        embed_dtype = self.embed_dtypes[autocast]
-        probe = torch.empty(0, dtype=embed_dtype, device=device)
-        cos, sin = self.text.rotary_emb(probe, position_ids)
-        key = (expert_batch, dims, cache.max_len, id(cache.k[0]), steps, autocast)
-        graph = self.graphs.get(key)
-        if graph is None:
-            graph = self._build(key, noise, cos, sin, cache, prefix_length, steps)
-            self.graphs[key] = graph
+        graph, cos, sin = self._graph(
+            cache, prefix_length, position_ids, expert_batch, device, kwargs, noise
+        )
         noise_in, cos_in, sin_in, seqlens = graph.args[:4]
         noise_in.copy_(noise)
         cos_in.copy_(cos)
         sin_in.copy_(sin)
         seqlens.fill_(prefix_length)
         return graph().clone()
+
+    def _graph(self, cache, prefix_length, position_ids, expert_batch, device, kwargs, noise):
+        """The graph for this call's shapes (built on first use) and its rotary tables."""
+        diffusion = self.expert.diffusion
+        dims = tuple(diffusion.x_dims)
+        steps = kwargs.get("inference_step") or diffusion.num_inference_steps
+        if noise is None:
+            noise = torch.zeros(expert_batch, *dims, device=device)
+        autocast = autocast_state(noise.device.type)
+        if autocast not in self.embed_dtypes:
+            probe_t = torch.zeros(1, *[1] * len(dims), device=device)
+            self.embed_dtypes[autocast] = self.expert.action_in_proj(noise[:1], probe_t).dtype
+        probe = torch.empty(0, dtype=self.embed_dtypes[autocast], device=device)
+        cos, sin = self.text.rotary_emb(probe, position_ids)
+        key = (expert_batch, dims, cache.max_len, id(cache.k[0]), steps, autocast)
+        graph = self.graphs.get(key)
+        if graph is None:
+            graph = self._build(key, noise, cos, sin, cache, prefix_length, steps)
+            self.graphs[key] = graph
+        return graph, cos, sin
 
     def _build(self, key, noise, cos, sin, cache, prefix_length, steps) -> GraphedCall:
         rows, dims = key[0], key[1]

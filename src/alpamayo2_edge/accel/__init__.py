@@ -10,6 +10,7 @@ across consecutive streaming calls, and ``use_linear_patch_embedding`` computes 
 patch embedding as a GEMM. Nothing here changes the default inference path.
 """
 
+import warnings
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -26,6 +27,26 @@ from alpamayo2_edge.accel.vit_cache import VisionFeatureCache, image_frame_ids
 MODES = ("compile", "tuned")
 # Inductor mode of the decode step; every other part uses the default mode.
 _DECODE_MODES = {"compile": "default", "tuned": "max-autotune-no-cudagraphs"}
+# One compiled function serves every shape of its part, with one recompile per shape.
+_RECOMPILE_LIMIT = 64
+_recompile_limit = {"users": 0, "saved": None}
+
+
+def _raise_recompile_limit() -> None:
+    config = torch._dynamo.config
+    if _recompile_limit["users"] == 0:
+        _recompile_limit["saved"] = config.recompile_limit
+        config.recompile_limit = max(config.recompile_limit, _RECOMPILE_LIMIT)
+    _recompile_limit["users"] += 1
+
+
+def _restore_recompile_limit() -> None:
+    """Restore dynamo's limit once no accelerated model is left (unless changed since)."""
+    _recompile_limit["users"] -= 1
+    config = torch._dynamo.config
+    saved = _recompile_limit["saved"]
+    if _recompile_limit["users"] == 0 and config.recompile_limit == max(saved, _RECOMPILE_LIMIT):
+        config.recompile_limit = saved
 
 
 @dataclass(frozen=True)
@@ -37,8 +58,9 @@ class AccelConfig:
     everywhere. ``attention`` selects the vision and prefill kernel: ``"auto"`` uses
     FlashAttention 3 on Hopper when it is installed, and PyTorch SDPA otherwise.
     Decode and expert attention always use FlashAttention 2 ``flash_attn_with_kvcache``.
-    Shapes are bucketed to ``kv_bucket`` tokens. ``compile=False`` and
-    ``cuda_graphs=False`` run the same code eagerly, for debugging and CPU tests.
+    Shapes are bucketed to ``kv_bucket`` tokens. ``warmup`` eager runs precede each
+    CUDA-graph capture. ``compile=False`` and ``cuda_graphs=False`` run the same code
+    eagerly, for debugging and CPU tests.
     """
 
     mode: str = "tuned"
@@ -59,6 +81,9 @@ class AccelConfig:
             raise ValueError(f"Unknown parts {sorted(unknown)}; choose from {PARTS}")
         if self.kv_bucket < 1 or self.warmup < 0:
             raise ValueError("kv_bucket must be positive and warmup nonnegative")
+        if self.cuda_graphs and self.warmup < 1:
+            # Compilation and cuBLAS initialization cannot run inside a graph capture.
+            raise ValueError("CUDA graphs need at least one warm-up run before capture")
 
 
 class AccelHandle:
@@ -99,10 +124,13 @@ class AccelHandle:
 
     def remove(self) -> None:
         """Restore the original methods (wrappers installed later must be removed first)."""
+        if self.model._alpamayo2_edge_accel is not self:
+            return
         for accelerator in reversed(self.accelerators):
             accelerator.remove()
         self.accelerators = []
         self.model._alpamayo2_edge_accel = None
+        _restore_recompile_limit()
 
 
 def enable_acceleration(model: torch.nn.Module, config: AccelConfig | None = None) -> AccelHandle:
@@ -110,11 +138,15 @@ def enable_acceleration(model: torch.nn.Module, config: AccelConfig | None = Non
 
     The first call for each new shape compiles and captures graphs inline (tens of
     seconds); later calls replay them. Inputs outside the supported envelope run
-    the original eager code, counted in ``handle.describe()["fallbacks"]``.
+    the original eager code, counted in ``handle.describe()["fallbacks"]``. Parts
+    that cannot run here (for example without FlashAttention 2) stay eager: they are
+    listed in ``handle.skipped`` and reported with a ``RuntimeWarning``.
     """
     config = config or AccelConfig()
     if getattr(model, "_alpamayo2_edge_accel", None) is not None:
         raise RuntimeError("Acceleration is already enabled on this model")
+    if getattr(model.vlm.model.visual, "_alpamayo2_edge_vit_cache", None) is not None:
+        raise RuntimeError("Enable acceleration before installing a VisionFeatureCache")
     if not model.config.enable_expert:
         raise ValueError("Acceleration requires the trajectory expert")
     device = model.device
@@ -134,9 +166,15 @@ def enable_acceleration(model: torch.nn.Module, config: AccelConfig | None = Non
         if part in requested and part not in skipped and not has_decode:
             skipped[part] = "requires the decode part"
     parts = [part for part in PARTS if part in requested and part not in skipped]
-    dynamo_config = torch._dynamo.config
-    # One compiled function serves every shape of its part; allow a recompile per shape.
-    dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 64)
+    if skipped:
+        skipped = {part: skipped[part] for part in PARTS if part in skipped}
+        reasons = "; ".join(f"{part} {reason}" for part, reason in skipped.items())
+        warnings.warn(
+            f"Acceleration runs {', '.join(skipped)} eagerly ({reasons}); accelerated parts: "
+            f"{', '.join(parts) or 'none'}. See docs/acceleration.md#requirements.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     stats = AccelStats()
     common = dict(
         stats=stats,
@@ -167,6 +205,7 @@ def enable_acceleration(model: torch.nn.Module, config: AccelConfig | None = Non
         )
     handle = AccelHandle(model, config, kernels, skipped, stats, accelerators)
     model._alpamayo2_edge_accel = handle
+    _raise_recompile_limit()
     return handle
 
 

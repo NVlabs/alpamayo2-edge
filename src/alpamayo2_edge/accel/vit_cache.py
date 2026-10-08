@@ -10,13 +10,19 @@ and DeepStack features do not depend on the other images in the call. The cache
 stores them per frame and encodes only frames it has not seen, normally the
 newest frame of each camera.
 
-Frames are identified by the caller (``image_frame_ids`` gives ``(camera, capture
-time in microseconds)`` from a raw sample) together with the frame's patch grid
-and a fingerprint of its pixels. A reused feature therefore requires the same
-frame identity, resolution and sampled pixel content. ``full_digest=True`` hashes
-every pixel instead of a strided sample, at about 2 ms of CPU time per image.
+Frames are identified by the caller, together with the frame's patch grid and a
+fingerprint of its pixels. ``image_frame_ids`` gives ``(stream, camera, capture
+time in microseconds)`` for a raw sample, where ``stream`` is the sample's
+``clip_id`` (PhysicalAI-AV samples carry one) unless the caller names the stream.
+Frame IDs must be unique within one cache. The fingerprint is a 128-bit hash of
+about 16 values of every patch (well under 0.1 ms per image), a safeguard against
+reused IDs rather than a proof of identity; ``full_digest=True`` hashes every pixel
+instead, at about 2 ms of CPU time per image.
 
-Usage, with one cache per stream (call ``clear()`` when the stream changes)::
+The cache does not track the model: call ``clear()`` after changing weights, the
+patch embedding or the acceleration settings, and when the stream changes.
+
+Usage, with one cache per stream::
 
     cache = VisionFeatureCache(model)
     for sample in samples:  # consecutive time steps
@@ -27,12 +33,12 @@ Usage, with one cache per stream (call ``clear()`` when the stream changes)::
 """
 
 import hashlib
-import zlib
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 from transformers.models.qwen3_vl.modeling_qwen3_vl import BaseModelOutputWithDeepstackFeatures
 
@@ -42,27 +48,52 @@ from alpamayo2_edge.sample import canonical_frame_order
 Features = tuple[torch.Tensor, tuple[torch.Tensor, ...]]  # merged rows, DeepStack rows
 
 
-def image_frame_ids(sample: Mapping[str, Any]) -> list[tuple[int, int]]:
-    """``(camera, capture time in µs)`` of each image of a raw sample, in ``pixel_values`` order.
+def image_frame_ids(
+    sample: Mapping[str, Any], stream: Hashable | None = None
+) -> list[tuple[Hashable, int, int]]:
+    """``(stream, camera, capture time in µs)`` of each image of a raw sample.
 
-    ``prepare_model_inputs`` packs images sorted by camera, then capture time
-    (``canonical_frame_order``).
+    IDs follow the ``pixel_values`` order: ``prepare_model_inputs`` packs images
+    sorted by camera, then capture time (``canonical_frame_order``). ``stream``
+    defaults to the sample's ``clip_id`` (``None`` without one). Name the stream
+    explicitly when timestamps can repeat across the samples that share a cache,
+    for example clip-relative times of local samples.
     """
+    if stream is None:
+        stream = sample.get("clip_id")
     cameras, times = sample["camera_indices"], sample["absolute_timestamps"].reshape(-1)
     order = canonical_frame_order(cameras, times)
-    return list(zip(cameras[order].tolist(), times[order].tolist(), strict=True))
+    return [
+        (stream, camera, time)
+        for camera, time in zip(cameras[order].tolist(), times[order].tolist(), strict=True)
+    ]
 
 
 def _fingerprint(rows: torch.Tensor, full_digest: bool) -> str:
     rows = rows.detach()
     if not full_digest:
-        # A strided sample of patch rows: any other frame differs in these rows.
-        index = torch.linspace(0, rows.shape[0] - 1, min(rows.shape[0], 16)).round().long()
-        rows = rows.index_select(0, index.to(rows.device))
+        # About 16 values of every patch row (every 97th value for the checkpoint's
+        # 1,536-value patches); the odd stride shifts the positions from row to row.
+        rows = rows.reshape(-1)[:: rows.shape[-1] // 16 | 1]
     data = rows.cpu().contiguous().view(torch.uint8).numpy()
     if full_digest:
         return hashlib.sha1(data).hexdigest()
-    return f"{zlib.crc32(data):08x}"
+    return hashlib.blake2b(data, digest_size=16).hexdigest()
+
+
+def _gather_rows(pixels: torch.Tensor, ranges: list[tuple[int, int]]) -> torch.Tensor:
+    """Concatenate row ranges of ``pixels`` (the patches of the frames to encode).
+
+    CPU tensors are copied with NumPy, single-threaded: ``torch.cat``'s OpenMP
+    threads stall on a busy host (66 ms instead of under 1 ms for 17 MB in a test
+    with 16 threads on a loaded 16-core machine).
+    """
+    if not ranges:
+        return pixels[:0]
+    if pixels.device.type == "cpu" and pixels.dtype in (torch.float32, torch.float16):
+        rows = [pixels[a:b].detach().numpy() for a, b in ranges]
+        return torch.from_numpy(np.concatenate(rows))
+    return torch.cat([pixels[a:b] for a, b in ranges])
 
 
 @dataclass
@@ -80,9 +111,10 @@ class _Plan:
 class VisionFeatureCache:
     """``visual.forward`` wrapper that reuses features of previously encoded frames.
 
-    Install it after any acceleration so that it wraps the outermost vision call.
-    ``prepare`` must run on the inputs of every call; its plan is consumed by the
-    next vision forward. Vision calls without a plan run uncached.
+    Install it after ``use_linear_patch_embedding`` and ``enable_acceleration``, so
+    that it wraps the outermost vision call. ``prepare`` must run on the inputs of
+    every call; its plan is consumed by the next vision forward. Vision calls without
+    a plan run uncached.
     """
 
     def __init__(
@@ -91,6 +123,8 @@ class VisionFeatureCache:
         if max_images < 1:
             raise ValueError("max_images must be positive")
         self.visual = model.vlm.model.visual
+        if getattr(self.visual, "_alpamayo2_edge_vit_cache", None) is not None:
+            raise RuntimeError("A VisionFeatureCache is already installed on this model")
         self.merge = int(self.visual.spatial_merge_size)
         self.max_images = max_images
         self.full_digest = full_digest
@@ -106,6 +140,7 @@ class VisionFeatureCache:
         self.installed = override_forward(self.inner, self._forward)
         self._had_instance_forward = "forward" in vars(self.visual)
         self.visual.forward = self.installed
+        self.visual._alpamayo2_edge_vit_cache = self
 
     def remove(self) -> None:
         """Restore the vision forward this cache wrapped."""
@@ -115,9 +150,10 @@ class VisionFeatureCache:
             self.visual.forward = self.inner
         else:
             del self.visual.forward
+        del self.visual._alpamayo2_edge_vit_cache
 
     def clear(self) -> None:
-        """Drop every cached feature, for example at a stream boundary."""
+        """Drop every cached feature: at a stream boundary, or after any model change."""
         self.store.clear()
         self._plan = None
 
@@ -127,7 +163,8 @@ class VisionFeatureCache:
     def prepare(self, inputs: Mapping[str, Any], frame_ids: Sequence[Hashable]) -> dict[str, Any]:
         """Return ``inputs`` with patches only for frames whose features are not cached.
 
-        ``frame_ids`` names each image of ``tokenized_data["pixel_values"]`` in order.
+        ``frame_ids`` names each image of ``tokenized_data["pixel_values"]`` in order,
+        for example ``image_frame_ids(sample)``; IDs must be unique within the cache.
         """
         data = inputs["tokenized_data"]
         pixels, grid_thw = data.get("pixel_values"), data.get("image_grid_thw")
@@ -157,10 +194,7 @@ class VisionFeatureCache:
             else:
                 self.store.move_to_end(key)
                 reused[index] = features
-        if misses:
-            kept = torch.cat([pixels[starts[i] : starts[i] + patches[i]] for i in misses])
-        else:
-            kept = pixels[:0]
+        kept = _gather_rows(pixels, [(starts[i], starts[i] + patches[i]) for i in misses])
         self._plan = _Plan(
             grid=grid,
             tokens=[count // self.merge**2 for count in patches],

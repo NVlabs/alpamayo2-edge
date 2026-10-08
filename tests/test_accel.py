@@ -132,7 +132,7 @@ def _image_inputs(last_token=5, seed=0, grids=GRIDS):
     }
 
 
-def _sample(model, inputs, num_traj_sets=1, max_generation_length=8, seed=3):
+def _sample(model, inputs, num_traj_sets=1, max_generation_length=8, seed=3, top_k=1):
     device = model.device
     with (
         torch.inference_mode(),
@@ -140,7 +140,7 @@ def _sample(model, inputs, num_traj_sets=1, max_generation_length=8, seed=3):
     ):
         return model.sample_trajectories_from_data(
             inputs,
-            top_k=1,
+            top_k=top_k,
             num_traj_sets=num_traj_sets,
             max_generation_length=max_generation_length,
             diffusion_kwargs={
@@ -197,12 +197,55 @@ def test_parts_without_flash_attention_are_skipped(monkeypatch):
             "expert": None,
         },
     )
-    handle = enable_acceleration(model, _cpu_config())
+    with pytest.warns(RuntimeWarning, match="flash_attn") as record:
+        handle = enable_acceleration(model, _cpu_config())
+    assert "accelerated parts: vision" in str(record[0].message)
     report = handle.describe()
     assert report["parts"] == ["vision"]
     assert set(report["skipped"]) == {"prefill", "decode", "expert"}
     handle.remove()
     assert "forward" not in vars(model.vlm.model.visual)
+
+
+def test_config_validation_and_recompile_limit(monkeypatch):
+    with pytest.raises(ValueError, match="warm-up"):
+        AccelConfig(warmup=0)
+    AccelConfig(warmup=0, cuda_graphs=False)
+    with pytest.raises(ValueError, match="mode"):
+        AccelConfig(mode="fast")
+    dynamo_config = torch._dynamo.config
+    monkeypatch.setattr(dynamo_config, "recompile_limit", 8)
+    first, second = _tiny_model(monkeypatch), _tiny_model(monkeypatch)
+    handles = [enable_acceleration(model, _cpu_config()) for model in (first, second)]
+    assert dynamo_config.recompile_limit == 64
+    handles[0].remove()
+    handles[0].remove()  # A second removal does nothing.
+    assert dynamo_config.recompile_limit == 64  # The other model still needs it.
+    handles[1].remove()
+    assert dynamo_config.recompile_limit == 8
+
+
+def test_install_order_of_vision_options(monkeypatch):
+    from alpamayo2_edge.accel import use_linear_patch_embedding
+
+    model = _tiny_model(monkeypatch)
+    embed = model.vlm.model.visual.patch_embed
+    cache = VisionFeatureCache(model)
+    with pytest.raises(RuntimeError, match="before installing a VisionFeatureCache"):
+        enable_acceleration(model, _cpu_config())
+    with pytest.raises(RuntimeError, match="already installed"):
+        VisionFeatureCache(model)
+    with pytest.raises(RuntimeError, match="Switch the patch embedding"):
+        use_linear_patch_embedding(model)
+    cache.remove()
+    restore = use_linear_patch_embedding(model)
+    assert "forward" in vars(embed)
+    handle = enable_acceleration(model, _cpu_config())
+    with pytest.raises(RuntimeError, match="Switch the patch embedding"):
+        restore()  # Graphs captured with the GEMM would keep it.
+    handle.remove()
+    restore()
+    assert "forward" not in vars(embed)
 
 
 def test_mask_columns_matches_mask_token_ids_processor():
@@ -290,7 +333,10 @@ def test_eager_expert_reads_the_flash_cache_like_a_dynamic_cache(monkeypatch):
     expected = sample(dynamic)
     handle = enable_acceleration(model, _cpu_config())
     torch.testing.assert_close(sample(flash), expected, rtol=1e-6, atol=1e-6)
-    assert handle.describe()["fallbacks"] == {"expert_mask": 1}
+    report = handle.describe()
+    assert report["fallbacks"] == {"expert_mask": 1}
+    # The graph for this shape is built anyway, ready for CoTs of equal length.
+    assert [build["part"] for build in report["builds"]] == ["expert"]
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -397,11 +443,18 @@ def test_padded_prompts_and_unsupported_samplers_fall_back(monkeypatch):
     assert handle.describe()["fallbacks"] == {"decode_padding": 1, "expert_without_flash_cache": 1}
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
-def test_compiled_cuda_graphs_match_eager_on_gpu(monkeypatch):
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+
+
+def _gpu_model(monkeypatch):
     if resolve_kernels("sdpa", "cuda")["decode"] is None:
         pytest.skip("requires an importable flash_attn (FlashAttention 2)")
-    model = _tiny_model(monkeypatch, dtype="bfloat16").to(device="cuda", dtype=torch.bfloat16)
+    return _tiny_model(monkeypatch, dtype="bfloat16").to(device="cuda", dtype=torch.bfloat16)
+
+
+@requires_cuda
+def test_compiled_cuda_graphs_match_eager_on_gpu(monkeypatch):
+    model = _gpu_model(monkeypatch)
     inputs = _to_cuda(_image_inputs())
     expected = _sample(model, inputs)
     handle = enable_acceleration(model, AccelConfig(attention="sdpa"))
@@ -421,6 +474,95 @@ def test_compiled_cuda_graphs_match_eager_on_gpu(monkeypatch):
     torch.testing.assert_close(again[0], actual[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[0], expected[0], rtol=0.05, atol=0.05)
     handle.remove()
+
+
+@requires_cuda
+def test_graph_replays_read_new_inputs_on_gpu(monkeypatch):
+    model = _gpu_model(monkeypatch)
+    first = _to_cuda(_image_inputs())
+    # Same shapes as the first input; new pixels, a longer CoT and new diffusion noise.
+    second = _to_cuda(_image_inputs(last_token=4, seed=1))
+    expected = _sample(model, second, seed=11)
+    config = AccelConfig(mode="compile", attention="sdpa")  # No autotuning: same kernels.
+    handle = enable_acceleration(model, config)
+    _sample(model, first)  # Builds every graph on the first input.
+    builds = handle.describe()["graph_builds"]
+    replayed = _sample(model, second, seed=11)
+    report = handle.describe()
+    assert report["graph_builds"] == builds  # The second input only replays graphs.
+    assert report["fallbacks"] == {}
+    handle.remove()
+    handle = enable_acceleration(model, config)
+    direct = _sample(model, second, seed=11)  # Graphs built on the second input itself.
+    handle.remove()
+    # A replay must read every new input; stale static buffers would show up here.
+    assert torch.equal(replayed[3]["generated_ids"], direct[3]["generated_ids"])
+    assert torch.equal(replayed[0], direct[0])
+    assert expected[3]["generated_ids"][0, :5].tolist() == [5, 6, 7, 8, ANCHOR]
+    assert torch.equal(replayed[3]["generated_ids"], expected[3]["generated_ids"])
+    torch.testing.assert_close(replayed[0], expected[0], rtol=0.05, atol=0.05)
+
+
+def _generate(model, inputs, n_samples, seed):
+    """``Alpamayo2Edge._generate_with_shared_prefill`` with the CLI's sampling settings."""
+    from transformers import LogitsProcessorList, StoppingCriteriaList
+
+    from alpamayo2_edge.models.alpamayo2_edge import (
+        MaskDiscreteTrajectoryLogitsProcessor,
+        MaskTokenIdsLogitsProcessor,
+    )
+    from alpamayo2_edge.models.expert_utils import StopAfterEOS
+
+    config = copy.deepcopy(model.vlm.generation_config)
+    config.update(
+        do_sample=True,
+        top_p=0.98,
+        top_k=None,
+        temperature=0.6,
+        num_beams=1,
+        max_new_tokens=8,
+        return_dict_in_generate=True,
+        use_cache=True,
+        pad_token_id=0,
+        eos_token_id=None,
+    )
+    processors = LogitsProcessorList(
+        [
+            MaskDiscreteTrajectoryLogitsProcessor(100, 10),
+            MaskDiscreteTrajectoryLogitsProcessor(110, 10),
+            MaskTokenIdsLogitsProcessor([2]),
+        ]
+    )
+    torch.manual_seed(seed)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        outputs = model._generate_with_shared_prefill(
+            dict(inputs["tokenized_data"]),
+            generation_config=config,
+            n_samples_total=n_samples,
+            logits_processor=processors,
+            stopping_criteria=StoppingCriteriaList([StopAfterEOS(ANCHOR)]),
+        )
+    return outputs.sequences
+
+
+@requires_cuda
+@pytest.mark.parametrize("n_samples", [1, 3])
+def test_graphed_sampler_draws_the_eager_random_numbers_on_gpu(monkeypatch, n_samples):
+    model = _gpu_model(monkeypatch)
+    with torch.no_grad():
+        model.vlm.lm_head.weight.zero_()  # Uniform logits: every token is a random draw.
+    inputs = _to_cuda(_image_inputs())
+    handle = enable_acceleration(model, AccelConfig(attention="sdpa"))
+    # The first call also builds the graphs, which must leave the RNG state unchanged.
+    accelerated = [_generate(model, inputs, n_samples, seed) for seed in (0, 1)]
+    report = handle.describe()
+    assert "decode_sample" in {build["part"] for build in report["builds"]}
+    assert "sampler_unsupported" not in report["fallbacks"]
+    handle.remove()
+    eager = [_generate(model, inputs, n_samples, seed) for seed in (0, 1)]
+    assert not torch.equal(eager[0], eager[1])
+    for got, want in zip(accelerated, eager, strict=True):
+        assert torch.equal(got, want)
 
 
 def _to_cuda(inputs):
@@ -503,7 +645,7 @@ def test_vit_cache_keys_and_contract(monkeypatch):
     altered["tokenized_data"]["pixel_values"] += 1
     with torch.inference_mode():
         encode(**_inputs(cache.prepare(batch, steps[0])))
-        # Same frame IDs with different pixels never reuse features.
+        # The pixel fingerprint catches reused frame IDs with different pixels.
         prepared = cache.prepare(altered, steps[0])
         assert prepared["tokenized_data"]["pixel_values"].shape == (120, PATCH_DIM)
         encode(**_inputs(prepared))
@@ -519,6 +661,20 @@ def test_vit_cache_keys_and_contract(monkeypatch):
         cache.prepare(batch, steps[0][:-1])
     cache.remove()
     assert "forward" not in vars(model.vlm.model.visual)
+
+
+def test_vit_cache_fingerprint_samples_every_patch():
+    from alpamayo2_edge.accel.vit_cache import _fingerprint
+
+    # The tiny model's patches and the checkpoint's 1,536-value patches.
+    for width in (PATCH_DIM, 1536):
+        rows = torch.randn(24, width, generator=torch.Generator().manual_seed(width))
+        reference = _fingerprint(rows, full_digest=False)
+        for row in range(rows.shape[0]):
+            changed = rows.clone()
+            changed[row] += 1
+            assert _fingerprint(changed, full_digest=False) != reference
+        assert _fingerprint(rows.clone(), full_digest=False) == reference
 
 
 def test_image_frame_ids_follow_the_packed_image_order():
@@ -537,9 +693,13 @@ def test_image_frame_ids_follow_the_packed_image_order():
         "nav_text": ["Continue straight"],
     }
     canonical = canonicalize_sample(sample)
-    assert image_frame_ids(sample) == list(
+    expected = list(
         zip(canonical["camera_indices"].tolist(), canonical["absolute_timestamps"].tolist())
     )
+    assert image_frame_ids(sample) == [(None, *pair) for pair in expected]
+    # Clip-relative timestamps repeat across clips; the clip ID keeps frame IDs apart.
+    assert image_frame_ids({**sample, "clip_id": "clip-a"})[0] == ("clip-a", *expected[0])
+    assert image_frame_ids(sample, stream="drive-7")[0] == ("drive-7", *expected[0])
 
 
 def test_vit_cache_matches_uncached_trajectories(monkeypatch):
@@ -556,3 +716,31 @@ def test_vit_cache_matches_uncached_trajectories(monkeypatch):
     actual = _sample(model, prepared)
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     assert torch.equal(actual[3]["generated_ids"], expected[3]["generated_ids"])
+
+
+def test_vit_cache_on_accelerated_vision_matches_uncached(monkeypatch):
+    model = _tiny_model(monkeypatch)
+    handle = enable_acceleration(model, _cpu_config())
+    cache = VisionFeatureCache(model)  # Installed after acceleration: it wraps the graphs.
+    inputs = _image_inputs()
+    ids = [("clip", index % 2, index) for index in range(len(GRIDS))]
+    # The next time step: images 3 and 4 are new frames, images 0-2 were seen before.
+    later = copy.deepcopy(inputs)
+    new = torch.randn(40, PATCH_DIM, generator=torch.Generator().manual_seed(8))
+    later["tokenized_data"]["pixel_values"][56:] = new
+    later_ids = ids[:3] + [("clip", 1, 10), ("clip", 0, 11)]
+    expected, expected_later = _sample(model, inputs), _sample(model, later)  # Uncached.
+    for batch, frame_ids, want, encoded in (
+        (inputs, ids, expected, 96),  # Every frame is new.
+        (inputs, ids, expected, 0),  # Every frame is cached.
+        (later, later_ids, expected_later, 40),  # Two new frames.
+    ):
+        prepared = cache.prepare(batch, frame_ids)
+        assert prepared["tokenized_data"]["pixel_values"].shape[0] == encoded
+        actual = _sample(model, prepared)
+        assert torch.equal(actual[3]["generated_ids"], want[3]["generated_ids"])
+        torch.testing.assert_close(actual[0], want[0], rtol=1e-5, atol=1e-5)
+    assert cache.describe()["images_reused"] == 5 + 3
+    assert handle.describe()["fallbacks"] == {}
+    cache.remove()
+    handle.remove()

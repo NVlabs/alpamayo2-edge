@@ -4,6 +4,7 @@
 """The vision patch embedding as one GEMM instead of a stride == kernel Conv3d."""
 
 import types
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -21,12 +22,25 @@ def _linear_patch_embed_forward(self, hidden_states: torch.Tensor) -> torch.Tens
     return F.linear(patches, weight.reshape(weight.shape[0], -1), self.proj.bias)
 
 
-def use_linear_patch_embedding(model: torch.nn.Module) -> None:
+def _check_switchable(model: torch.nn.Module) -> None:
+    if getattr(model, "_alpamayo2_edge_accel", None) is not None or (
+        getattr(model.vlm.model.visual, "_alpamayo2_edge_vit_cache", None) is not None
+    ):
+        # Captured vision graphs and cached features would keep the previous embedding.
+        raise RuntimeError(
+            "Switch the patch embedding before enable_acceleration and VisionFeatureCache"
+        )
+
+
+def use_linear_patch_embedding(model: torch.nn.Module) -> Callable[[], None]:
     """Replace the vision patch embedding's Conv3d by the equivalent GEMM (in place).
 
     Results agree with the convolution to rounding (about one BF16 ulp); the GEMM
-    avoids slow BF16 Conv3d fallbacks, such as PyTorch 2.9 on GB10 (sm_121).
+    avoids slow BF16 Conv3d fallbacks, such as PyTorch 2.9 on GB10 (sm_121). Call it
+    before ``enable_acceleration`` and before installing a ``VisionFeatureCache``.
+    Returns a function that restores the Conv3d.
     """
+    _check_switchable(model)
     embed = model.vlm.model.visual.patch_embed
     conv = embed.proj
     if not (
@@ -37,4 +51,17 @@ def use_linear_patch_embedding(model: torch.nn.Module) -> None:
         and conv.groups == 1
     ):
         raise ValueError(f"Patch embedding is not a kernel == stride Conv3d: {conv}")
-    embed.forward = types.MethodType(_linear_patch_embed_forward, embed)
+    previous = vars(embed).get("forward")
+    installed = types.MethodType(_linear_patch_embed_forward, embed)
+    embed.forward = installed
+
+    def restore() -> None:
+        _check_switchable(model)
+        if vars(embed).get("forward") is not installed:
+            raise RuntimeError("The patch embedding changed after use_linear_patch_embedding")
+        if previous is None:
+            del embed.forward
+        else:
+            embed.forward = previous
+
+    return restore
