@@ -10,10 +10,7 @@ at 0.1-second intervals.
 
 Early-access weights are hosted at
 [nvidia/EA-Alpamayo2-Edge](https://huggingface.co/nvidia/EA-Alpamayo2-Edge).
-Model access requires an authorized Hugging Face account. The model files are at
-the repository root; no `--subfolder` is needed. Load example clips directly from
-PhysicalAI-AV. This implementation supports the above linked checkpoint and its
-22-image, 20-pose input profile.
+Model access requires an authorized Hugging Face account.
 
 ## Setup
 
@@ -34,9 +31,7 @@ runtime can change sampled text and trajectories.
 
 ## Run a PhysicalAI-AV navigation example
 
-This path follows the [Alpamayo 2 Super navigation example](https://github.com/NVlabs/alpamayo2/blob/59776920bbd981f2c989213bba5ee8594e71ed1d/examples/two_gpu_nav_cfg_demo.py):
-load a clip through the public dataset SDK, prepare the Edge input profile, and
-run the model. Install the optional dataset dependency and authenticate with a
+Install the optional dataset dependency and authenticate with a
 Hugging Face account that has access to both the checkpoint and
 [PhysicalAI-Autonomous-Vehicles](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles).
 The dataset requires accepting its access terms on Hugging Face.
@@ -53,15 +48,10 @@ python -m alpamayo2_edge.inference \
     --output outputs/physicalai-nav
 ```
 
-This downloads the model assets from the EA repository and reads images and ego
-history through the PhysicalAI-AV SDK. The HF model repository contains no examples.
-[examples/nav_samples.json](examples/nav_samples.json) pairs the published Super
-demo clip `ea7bbd31-b7a5-4972-8dbd-7089e6b53de4` at **4.0 seconds** with its demo
-instruction **`Turn right in 30m`**. Super stores the clip/time in its navigation
-manifest and the instruction in its demo script; this manifest records both and
-their source commit. The navigation is a supplied instruction, not a route label
-read from the public dataset. This runs Edge's ordinary navigation-conditioned
-inference; Super's two-GPU classifier-free guidance implementation is separate.
+This downloads the model and loads camera images and ego history through the
+PhysicalAI-AV SDK. The [example manifest](examples/nav_samples.json) selects clip
+`ea7bbd31-b7a5-4972-8dbd-7089e6b53de4` at **4.0 seconds** with the navigation
+instruction **`Turn right in 30m`**.
 
 For a local checkpoint and an explicitly selected clip:
 
@@ -75,9 +65,8 @@ python -m alpamayo2_edge.inference \
 ```
 
 `--manifest` selects index 0 by default; use `--sample-index` for other entries.
-Each entry supplies `clip_id`, `t0_us`, and `nav_text`. You can also pass Super's
-clip/time-only manifests with an explicit `--nav-text`. An explicit navigation
-argument overrides the selected entry. Direct `--clip-id` input always requires
+Each entry supplies `clip_id`, `t0_us`, and `nav_text`. Use `--nav-text` to override
+the selected entry's navigation instruction. Direct `--clip-id` input requires
 `--nav-text`; `--t0-us` defaults to 5,100,000 microseconds when omitted.
 
 The loader reads six cameras using the 22-frame schedule below and 20 historical
@@ -125,15 +114,8 @@ python -m alpamayo2_edge.inference \
     --output outputs/local-model
 ```
 
-Model-ID inference defaults to seed 43, one reasoning continuation and one
-trajectory, temperature 0.6, top-p 0.98, no top-k limit, at most 256 generated
-tokens, and ten Euler diffusion steps. The model prefills
-the prompt once, then samples `num_traj_sets * num_traj_samples` independent
-reasoning continuations. Each continuation conditions one expert trajectory;
-the set and sample dimensions group these candidates in the output. Both `6 / 1`
-and `1 / 6` generate six reasoning continuations and six trajectories. The CLI
-seeds text generation and a separate diffusion generator for each input sample.
-Override the output grouping explicitly:
+Inference generates one reasoning continuation and one trajectory by default.
+To generate six independent candidates:
 
 ```bash
 python -m alpamayo2_edge.inference \
