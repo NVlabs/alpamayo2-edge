@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -156,3 +158,47 @@ def test_report_records_linear_patch_embedding(tmp_path, monkeypatch):
     inference.main([*args, "--patch-embed", "linear"])
     assert json.loads((tmp_path / "report.json").read_text())["patch_embedding"] == "linear"
     assert calls == [model]
+
+
+def test_cli_acceleration_requires_cuda_and_bfloat16(capsys):
+    from alpamayo2_edge.inference import main
+
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                *("--model-id", "dummy", "--sample", "sample_000", "--output", "output"),
+                *("--device", "cpu", "--dtype", "float32", "--accel", "tuned"),
+            ]
+        )
+    assert error.value.code == 2
+    assert "--accel requires" in capsys.readouterr().err
+
+
+def test_report_records_acceleration(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from alpamayo2_edge import accel, inference, sample
+
+    model = _fake_cli_model(monkeypatch)
+    calls = []
+
+    def enable_acceleration(model, config):
+        calls.append(config)
+        return SimpleNamespace(describe=lambda: {"parts": ["vision"], "fallbacks": {}})
+
+    monkeypatch.setattr(accel, "enable_acceleration", enable_acceleration)
+    monkeypatch.setattr(sample, "load_sample", lambda path: {"path": path})
+    monkeypatch.setattr(inference, "warm_up", lambda *args: calls.append(args))
+    inference.main(
+        [
+            *("--model-id", "model", "--sample", "sample_000", "--output", str(tmp_path)),
+            *("--accel", "compile", "--accel-attention", "sdpa", "--accel-warmup", "2"),
+        ]
+    )
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["acceleration"]["parts"] == ["vision"]
+    assert report["acceleration"]["warmup_runs"] == 2
+    assert (calls[0].mode, calls[0].attention) == ("compile", "sdpa")
+    assert calls[1][0] is model and calls[1][1] == {"path": Path("sample_000")}
+    assert calls[1][-1] == 2

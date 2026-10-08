@@ -61,6 +61,24 @@ def predict(model, prepared: dict, settings: dict, device: str) -> tuple:
     return xyz, rot, extra
 
 
+def warm_up(model, data: dict, settings: dict, device: str, runs: int) -> None:
+    """Untimed runs that compile and capture the accelerated graphs for ``data``."""
+    from alpamayo2_edge.helper import prepare_model_inputs, to_device
+
+    prepared = to_device(prepare_model_inputs(data, model.config, model.tokenizer), device=device)
+    for _ in range(runs):
+        predict(model, prepared, settings, device)
+
+
+def _package_version(name: str) -> str | None:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+
+
 def run_sample(model, sample_path: Path, output: Path, settings: dict, device: str) -> dict:
     from alpamayo2_edge.sample import load_sample
 
@@ -212,6 +230,26 @@ def main(argv=None) -> None:
     parser.add_argument("--diffusion-steps", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument(
+        "--accel",
+        choices=["off", "compile", "tuned"],
+        default="off",
+        help="torch.compile + CUDA graphs for vision, prefill, decode and the expert "
+        "(CUDA, BF16, needs flash-attn); tuned also autotunes the decode step",
+    )
+    parser.add_argument(
+        "--accel-attention",
+        choices=["auto", "fa3", "sdpa"],
+        default="auto",
+        help="Vision/prefill attention in the graphs; auto uses FlashAttention 3 on Hopper "
+        "when installed, otherwise SDPA",
+    )
+    parser.add_argument(
+        "--accel-warmup",
+        type=int,
+        default=1,
+        help="Untimed runs of the first input that compile and capture graphs (with --accel)",
+    )
+    parser.add_argument(
         "--patch-embed",
         choices=["conv", "linear"],
         default="conv",
@@ -249,6 +287,12 @@ def main(argv=None) -> None:
         parser.error(
             "CUDA is unavailable; run on a GPU host or explicitly select --device cpu --dtype float32"
         )
+    if args.accel != "off" and (
+        torch.device(args.device).type != "cuda" or args.dtype != "bfloat16"
+    ):
+        parser.error("--accel requires a CUDA --device and --dtype bfloat16")
+    if args.accel_warmup < 0:
+        parser.error("--accel-warmup must be nonnegative")
     settings = dict(
         seed=43,
         top_p=0.98,
@@ -305,10 +349,20 @@ def main(argv=None) -> None:
         revision=args.revision,
         local_files_only=args.local_files_only,
     )
+    acceleration = None
     if args.patch_embed == "linear":
         from alpamayo2_edge.accel import use_linear_patch_embedding
 
         use_linear_patch_embedding(model)
+    if args.accel != "off":
+        from alpamayo2_edge.accel import AccelConfig, enable_acceleration
+        from alpamayo2_edge.sample import load_sample
+
+        acceleration = enable_acceleration(
+            model, AccelConfig(mode=args.accel, attention=args.accel_attention)
+        )
+        first = data if clip is not None else load_sample(samples[0])
+        warm_up(model, first, settings, args.device, args.accel_warmup)
     if clip is not None:
         sample_id = f"{clip['clip_id']}_{clip['t0_us']}"
         records = [run_data(model, data, sample_id, args.output / sample_id, settings, args.device)]
@@ -331,6 +385,12 @@ def main(argv=None) -> None:
     }
     if args.patch_embed != "conv":
         report["patch_embedding"] = args.patch_embed
+    if acceleration is not None:
+        report["acceleration"] = {
+            **acceleration.describe(),
+            "warmup_runs": args.accel_warmup,
+            "flash_attn": _package_version("flash-attn"),
+        }
     if clip is not None:
         from importlib.metadata import version
 
