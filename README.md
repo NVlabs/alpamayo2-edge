@@ -70,12 +70,13 @@ the selected entry's navigation instruction. Direct `--clip-id` input requires
 `--nav-text`; `--t0-us` defaults to 5,100,000 microseconds when omitted.
 
 The loader reads six cameras using the 22-frame schedule below and 20 historical
-ego poses in the ego frame at `t0`. It retains actual decoded image timestamps in
-clip-relative microseconds and does not query future poses. The existing Edge
+ego poses in the ego frame at `ego_t0_us`, the latest actual image capture across
+all 22 frames. The requested `t0_us` remains the camera-sampling anchor. Both times
+use clip-relative microseconds. The loader does not query future poses. The existing Edge
 processor then builds the prompt and model inputs. Hugging Face access and
 streaming are handled by `physical-ai-av`; `HF_HUB_CACHE` can select its cache
 location. `--local-files-only` controls model loading only. Output records include
-the clip, time, navigation text, and resolved dataset revision.
+the clip, requested `t0_us`, actual `ego_t0_us`, navigation text, and resolved dataset revision.
 
 ## Download the model for local use
 
@@ -151,18 +152,32 @@ and rotations have shape `[1, 6, 1, 64, 3, 3]`.
 | `ego_history_xyz` | Floating point | `[1, 20, 3]` | Twenty finite ego positions. |
 | `ego_history_rot` | Floating point | `[1, 20, 3, 3]` | Corresponding finite rotation matrices. |
 
-The loader transforms history poses into the ego frame at `t0`. They span −1.9
-through 0 seconds at 0.1-second intervals and produce 57 delta tokens.
+The loader sets `ego_t0_us = max(absolute_timestamps)` after decoding all cameras.
+It samples history poses from `ego_t0_us - 1,900,000` through `ego_t0_us` in
+100,000-microsecond intervals and transforms both positions and rotations into
+the ego frame at `ego_t0_us`. These 20 poses produce 57 delta tokens. Predicted
+trajectories use the same frame; the default 64 future poses are at +0.1 through
++6.4 seconds relative to `ego_t0_us`. Use that anchor when converting predictions
+to world coordinates or projecting them onto camera images.
+
+The requested `t0_us` remains unchanged and determines the camera request times
+and sample identity. Sensor timing can make `ego_t0_us` earlier than `t0_us`.
+Both anchors appear in the sample dictionary and its provenance; provenance also
+records `ego_t0_source="max_captured_image_timestamp"`. The entire actual history
+window must lie within the SDK's inclusive egomotion bounds.
+
 `prepare_model_inputs` adds the model's leading batch dimension. The loader uses
 the following camera counts and sampling profile:
 
-| Cameras | Images per camera | Intended image offsets (seconds) | Pixel budget (min–max) |
+| Cameras | Images per camera | Requested offsets from `t0_us` (seconds) | Pixel budget (min–max) |
 | --- | --- | --- | --- |
 | 1, 6: front and front telephoto | 5 | −2, −1, −0.5, −0.1, 0 | 163840–196608 |
 | 0, 2, 3, 5: remaining cameras | 3 | −1, −0.1, 0 | 81920–98304 |
 
 Actual capture timestamps may have sensor jitter. Preprocessing sorts images by
-camera and timestamp together, renders relative-time labels, resizes in `uint8`
+camera and timestamp together. Image prompt time labels use the last capture in
+that camera-major ordering as their origin, which can differ from `ego_t0_us`.
+Preprocessing renders those labels, resizes in `uint8`
 with bicubic interpolation, and applies the checkpoint's normalization. Frame
 ordering, timestamps, and per-camera pixel budgets are part of the model input.
 

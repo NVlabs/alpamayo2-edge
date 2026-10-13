@@ -23,6 +23,71 @@ def test_hf5_loading_diagnostics_serialize_sets():
     assert json.loads(json.dumps(_json_value({"missing_keys": set()}))) == {"missing_keys": []}
 
 
+def test_run_data_records_ego_anchor_provenance_without_replacing_nominal_time(
+    tmp_path, monkeypatch
+):
+    import json
+    from types import SimpleNamespace
+
+    from alpamayo2_edge import helper, inference
+    from alpamayo2_edge.models import utils
+
+    data = {
+        "clip_id": "ea7bbd31-b7a5-4972-8dbd-7089e6b53de4",
+        "t0_us": 5_100_000,
+        "ego_t0_us": 5_099_981,
+        "nav_text": ["Turn right in 30 m."],
+        "provenance": {
+            "dataset": "nvidia/PhysicalAI-Autonomous-Vehicles",
+            "ego_t0_us": 5_099_981,
+            "ego_t0_source": "max_captured_image_timestamp",
+        },
+    }
+    prepared = {
+        "tokenized_data": {"input_ids": torch.tensor([[1, 2]], dtype=torch.int64)},
+        "ego_history_xyz": torch.zeros(1, 1, 20, 3),
+        "ego_history_rot": torch.eye(3).expand(1, 1, 20, 3, 3).contiguous(),
+    }
+    model = SimpleNamespace(
+        config=SimpleNamespace(traj_ids={}),
+        tokenizer=SimpleNamespace(decode=lambda *args, **kwargs: "Stub prompt"),
+        history_traj_tokenizer=None,
+        future_traj_tokenizer=None,
+    )
+    # Keep real output validation and serialization; no checkpoint or GPU is needed.
+    monkeypatch.setattr(helper, "prepare_model_inputs", lambda *args: prepared)
+    monkeypatch.setattr(utils, "fuse_traj_tokens", lambda history, future, ids, *args: ids)
+    monkeypatch.setattr(
+        inference,
+        "predict",
+        lambda *args: (
+            torch.zeros(1, 1, 1, 64, 3),
+            torch.eye(3).expand(1, 1, 1, 64, 3, 3).contiguous(),
+            {"cot": [[["Wait for the traffic light."]]]},
+        ),
+    )
+    sample_id = f"{data['clip_id']}_{data['t0_us']}"
+    output = tmp_path / sample_id
+    record = inference.run_data(
+        model, data, sample_id, output, {"num_traj_sets": 1, "num_traj_samples": 1}, "cpu"
+    )
+
+    saved = json.loads((output / "output.json").read_text())
+    assert saved == record
+    assert saved["sample_id"] == "ea7bbd31-b7a5-4972-8dbd-7089e6b53de4_5100000"
+    assert saved["input_source"] == {
+        "dataset": "nvidia/PhysicalAI-Autonomous-Vehicles",
+        "clip_id": "ea7bbd31-b7a5-4972-8dbd-7089e6b53de4",
+        "t0_us": 5_100_000,
+        "ego_t0_us": 5_099_981,
+        "ego_t0_source": "max_captured_image_timestamp",
+        "nav_text": "Turn right in 30 m.",
+    }
+    assert type(saved["input_source"]["ego_t0_us"]) is int
+    assert data["t0_us"] == 5_100_000
+    assert data["ego_t0_us"] == 5_099_981
+
+
 @pytest.mark.parametrize(
     "removed_args",
     [

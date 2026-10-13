@@ -27,6 +27,7 @@ class Camera:
         self.timestamps = np.array([0, 10_000_000], dtype=np.int64)
         self.requests = []
         self.mutate = lambda frames, times: (frames, times)
+        self.capture_lag_us = None
 
     def decode_images_from_timestamps(self, timestamps):
         self.requests.append(timestamps.copy())
@@ -34,7 +35,10 @@ class Camera:
         frames = np.zeros((count, 4, 8, 3), dtype=np.uint8)
         frames[:, :, :, 0] = (self.camera_id * 10 + np.arange(count))[:, None, None]
         # The SDK returns the closest frame at or before each requested time.
-        actual = timestamps + np.array([-17, -9, -23, -13, -19], dtype=np.int64)[:count]
+        if self.capture_lag_us is None:
+            actual = timestamps + np.array([-17, -9, -23, -13, -19], dtype=np.int64)[:count]
+        else:
+            actual = timestamps - self.capture_lag_us
         actual = np.maximum(actual, 0)
         return self.mutate(frames, actual)
 
@@ -168,13 +172,19 @@ def test_edge_camera_schedule_preserves_decoded_timestamps_and_image_association
     assert sample["nav_text"] == ["Turn left"]
     assert sample["clip_id"] == "clip-123"
     assert sample["t0_us"] == 5_100_000
+    assert sample["ego_t0_us"] == 5_099_981
+    assert sample["provenance"]["t0_us"] == 5_100_000
+    assert sample["provenance"]["ego_t0_us"] == 5_099_981
+    assert sample["provenance"]["ego_t0_source"] == "max_captured_image_timestamp"
     assert sample["camera_pixel_bounds"][0] == (81920, 98304)
     assert sample["camera_pixel_bounds"][1] == (163840, 196608)
     assert all(request[0] == "clip-123" and request[2] is False for request in dataset.requests)
 
 
-def test_history_uses_full_rigid_transform_at_t0_without_querying_future():
+def test_history_uses_full_rigid_transform_when_actual_and_requested_anchors_match():
     dataset = Dataset()
+    for camera in dataset.cameras.values():
+        camera.capture_lag_us = 0
     sample = load_physical_aiavdataset("clip-123", nav_text="Turn left", avdi=dataset)
     assert len(dataset.ego.requests) == 1
     assert dataset.ego.requests[0].tolist() == [
@@ -214,6 +224,87 @@ def test_history_uses_full_rigid_transform_at_t0_without_querying_future():
     )
     torch.testing.assert_close(sample["ego_history_rot"][0, -1], torch.eye(3), atol=1e-6, rtol=0)
     assert not any("future" in key for key in sample)
+
+
+@pytest.mark.parametrize("newest_camera", [0, 2, 6])
+def test_history_uses_latest_capture_across_all_cameras_and_its_full_rigid_frame(newest_camera):
+    dataset = Dataset()
+    for camera in dataset.cameras.values():
+        camera.capture_lag_us = 50_000
+    dataset.cameras[newest_camera].capture_lag_us = 31_478
+    sample = load_physical_aiavdataset("clip-123", nav_text="Turn left", avdi=dataset)
+
+    assert sample["t0_us"] == 5_100_000
+    assert sample["ego_t0_us"] == 5_068_522
+    assert type(sample["ego_t0_us"]) is int
+    assert type(sample["provenance"]["ego_t0_us"]) is int
+    assert sample["absolute_timestamps"].max().item() == 5_068_522
+    # Camera acquisition still uses the requested time, including the front -2s frame.
+    assert all(camera.requests[0][-1] == 5_100_000 for camera in dataset.cameras.values())
+    assert dataset.cameras[1].requests[0][0] == 3_100_000
+    assert len(dataset.ego.requests) == 1
+    history_times = dataset.ego.requests[0]
+    assert history_times.shape == (20,)
+    assert history_times[0] == 3_168_522
+    assert history_times[-1] == 5_068_522
+    np.testing.assert_array_equal(np.diff(history_times), np.full(19, 100_000))
+
+    # At the actual anchor the fixture has an extra +0.497021-degree roll.
+    # Applying its inverse to [-1.9, 3.8, -0.95] gives this hand-derived position.
+    torch.testing.assert_close(
+        sample["ego_history_xyz"][0, 0],
+        torch.tensor([-1.9, 3.7916162088454834, -0.9829275277558354]),
+        atol=1e-6,
+        rtol=0,
+    )
+    torch.testing.assert_close(sample["ego_history_xyz"][0, -1], torch.zeros(3), atol=1e-6, rtol=0)
+    torch.testing.assert_close(sample["ego_history_rot"][0, -1], torch.eye(3), atol=1e-6, rtol=0)
+    torch.testing.assert_close(
+        sample["ego_history_rot"][0, 0],
+        torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, np.sqrt(3) / 2, -0.5], [0.0, 0.5, np.sqrt(3) / 2]],
+            dtype=torch.float32,
+        ),
+        atol=1e-6,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "requested_t0,ego_t0,history_start",
+    [(5_100_000, 5_068_522, 3_168_522), (2_000_000, 1_968_522, 68_522)],
+)
+def test_actual_history_accepts_inclusive_bounds_even_when_nominal_anchor_is_outside(
+    requested_t0, ego_t0, history_start
+):
+    dataset = Dataset()
+    for camera in dataset.cameras.values():
+        camera.capture_lag_us = 31_478
+    dataset.ego.timestamps = np.array([history_start, ego_t0], dtype=np.int64)
+    sample = load_physical_aiavdataset("clip-123", requested_t0, nav_text="Straight", avdi=dataset)
+    assert sample["t0_us"] == requested_t0
+    assert sample["ego_t0_us"] == ego_t0
+    assert dataset.ego.requests[0][0] == history_start
+    assert dataset.ego.requests[0][-1] == ego_t0
+
+
+def test_actual_history_outside_lower_bound_is_rejected_without_interpolation():
+    dataset = Dataset()
+    for camera in dataset.cameras.values():
+        camera.capture_lag_us = 31_478
+    # The old nominal window [3.2s, 5.1s] fits; the actual window starts earlier.
+    dataset.ego.timestamps = np.array([3_168_523, 10_000_000], dtype=np.int64)
+    with pytest.raises(ValueError, match="egomotion.*3168522.*range"):
+        load_physical_aiavdataset("clip-123", nav_text="Straight", avdi=dataset)
+    assert dataset.ego.requests == []
+
+
+def test_camera_request_before_first_capture_still_fails_without_fallback():
+    dataset = Dataset()
+    dataset.cameras[6].timestamps = np.array([11, 10_000_000], dtype=np.int64)
+    with pytest.raises(ValueError, match="CAMERA_FRONT_TELE_30FOV.*range"):
+        load_physical_aiavdataset("clip-123", 2_000_000, nav_text="Straight", avdi=dataset)
+    assert dataset.cameras[6].requests == []
 
 
 @pytest.mark.parametrize("nav_text", ["", "  ", None, ["Go straight"]])

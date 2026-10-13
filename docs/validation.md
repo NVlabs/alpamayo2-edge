@@ -8,6 +8,13 @@ are historical measurements, not a fresh validation of every later code revision
 use the supported PhysicalAI-AV input path with local or Hugging Face model
 assets.
 
+Those recorded runs precede the loader's ego-anchor correction. The current
+loader uses the latest actual capture across all 22 images for its ego-history
+window and coordinate frame, and reports that timestamp as `ego_t0_us`. The
+requested `t0_us` still controls camera acquisition and sample identity. The
+CPU regressions below cover the correction; the historical GPU measurements
+remain associated with their recorded loader revisions.
+
 ## EA repository download and inference
 
 On 2026-10-07, inference succeeded after downloading directly from
@@ -305,8 +312,10 @@ CUDA_VISIBLE_DEVICES="" uv run --locked pytest
 Tests cover noncausal expert attention, shared prompt prefill, independent
 reasoning candidates, cache reuse, anchor completion, left padding, HF save/load,
 in-memory input validation, and CLI reports. Dataset tests cover per-camera
-sampling, timestamp jitter and image association, ego-frame pose transforms,
-inclusive time bounds, missing optional dependencies, and manifest navigation
+sampling, timestamp jitter and image association, the latest-capture ego anchor
+across cameras, full rigid pose transforms at that anchor, shifted history bounds
+including inclusive endpoints, anchor provenance in output records, missing
+optional dependencies, and manifest navigation
 selection and overrides. They use test fixtures and mocked dataset access; an
 actual checkpoint and dataset execution is checked with the navigation command
 above.

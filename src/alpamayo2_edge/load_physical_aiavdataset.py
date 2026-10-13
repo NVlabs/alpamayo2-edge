@@ -46,8 +46,10 @@ def load_physical_aiavdataset(
 
     ``t0_us`` and all camera timestamps use clip-relative integer microseconds.
     Front cameras 1/6 sample at -2/-1/-0.5/-0.1/0 seconds; the other four sample
-    at -1/-0.1/0 seconds. Actual decoder timestamps are retained. History poses
-    span -1.9 through 0 seconds and are transformed into the ego frame at t0.
+    at -1/-0.1/0 seconds. Actual decoder timestamps are retained. ``ego_t0_us``
+    is their maximum across all 22 frames; history poses span -1.9 through 0
+    seconds relative to it and use the ego frame at that actual capture time.
+    The returned ``t0_us`` remains the requested camera-sampling anchor.
 
     ``nav_text`` must be supplied explicitly: the public dataset does not supply
     the route instruction. No future trajectory or calibration is requested.
@@ -73,26 +75,6 @@ def load_physical_aiavdataset(
                 "install it with pip install 'alpamayo2-edge[dataset]'."
             ) from exc
         avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
-
-    egomotion = avdi.get_clip_feature(
-        clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=maybe_stream
-    )
-    history_timestamps = t0_us + np.arange(-1_900_000, 1, 100_000, dtype=np.int64)
-    _check_time_bounds(history_timestamps, egomotion.time_range, "egomotion")
-    history = egomotion(history_timestamps)
-    world_xyz = np.asarray(history.pose.translation)
-    world_rot = history.pose.rotation
-    matrices = world_rot.as_matrix()
-    if (
-        world_xyz.shape != (20, 3)
-        or matrices.shape != (20, 3, 3)
-        or not np.isfinite(world_xyz).all()
-        or not np.isfinite(matrices).all()
-    ):
-        raise ValueError("egomotion must provide 20 finite XYZ positions and 3x3 rotations")
-    t0_inverse = world_rot[-1].inv()
-    local_xyz = t0_inverse.apply(world_xyz - world_xyz[-1])
-    local_rot = (t0_inverse * world_rot).as_matrix()
 
     image_groups, camera_groups, timestamp_groups = [], [], []
     image_size = None
@@ -139,10 +121,34 @@ def load_physical_aiavdataset(
         camera_groups.append(torch.full((count,), camera_id, dtype=torch.int64))
         timestamp_groups.append(torch.from_numpy(timestamps))
 
+    absolute_timestamps = torch.cat(timestamp_groups)
+    ego_t0_us = int(absolute_timestamps.max().item())
+    egomotion = avdi.get_clip_feature(
+        clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=maybe_stream
+    )
+    history_timestamps = ego_t0_us + np.arange(-1_900_000, 1, 100_000, dtype=np.int64)
+    _check_time_bounds(history_timestamps, egomotion.time_range, "egomotion")
+    history = egomotion(history_timestamps)
+    world_xyz = np.asarray(history.pose.translation)
+    world_rot = history.pose.rotation
+    matrices = world_rot.as_matrix()
+    if (
+        world_xyz.shape != (20, 3)
+        or matrices.shape != (20, 3, 3)
+        or not np.isfinite(world_xyz).all()
+        or not np.isfinite(matrices).all()
+    ):
+        raise ValueError("egomotion must provide 20 finite XYZ positions and 3x3 rotations")
+    ego_t0_inverse = world_rot[-1].inv()
+    local_xyz = ego_t0_inverse.apply(world_xyz - world_xyz[-1])
+    local_rot = (ego_t0_inverse * world_rot).as_matrix()
+
     provenance = {
         "dataset": "nvidia/PhysicalAI-Autonomous-Vehicles",
         "clip_id": clip_id,
         "t0_us": t0_us,
+        "ego_t0_us": ego_t0_us,
+        "ego_t0_source": "max_captured_image_timestamp",
     }
     revision = getattr(avdi, "revision", None)
     if revision is not None:
@@ -150,7 +156,7 @@ def load_physical_aiavdataset(
     data = {
         "image_frames": torch.cat(image_groups).contiguous(),
         "camera_indices": torch.cat(camera_groups),
-        "absolute_timestamps": torch.cat(timestamp_groups),
+        "absolute_timestamps": absolute_timestamps,
         "ego_history_xyz": torch.from_numpy(local_xyz).float().unsqueeze(0),
         "ego_history_rot": torch.from_numpy(local_rot).float().unsqueeze(0),
         "nav_text": [nav_text],
@@ -161,6 +167,7 @@ def load_physical_aiavdataset(
         "history_num_steps": 20,
         "clip_id": clip_id,
         "t0_us": t0_us,
+        "ego_t0_us": ego_t0_us,
         "provenance": provenance,
     }
     validate_sample(data)
