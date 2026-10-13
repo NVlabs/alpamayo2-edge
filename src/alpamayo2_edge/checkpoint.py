@@ -13,9 +13,19 @@ def validate_checkpoint(path: Path) -> None:
         "config.json",
         "tokenizer.json",
         "tokenizer_config.json",
-        "preprocessor_config.json",
     ]
     missing = [name for name in required if not (path / name).is_file()]
+    if not (path / "preprocessor_config.json").is_file():
+        # Transformers 5 saves image settings inside the unified processor config.
+        processor_path = path / "processor_config.json"
+        processor_config = (
+            json.loads(processor_path.read_text()) if processor_path.is_file() else {}
+        )
+        image_config = (
+            processor_config.get("image_processor") if isinstance(processor_config, dict) else None
+        )
+        if not isinstance(image_config, dict) or not image_config:
+            missing.append("preprocessor_config.json (or processor_config.json image_processor)")
     if not (path / "chat_template.jinja").is_file():
         tokenizer_config = path / "tokenizer_config.json"
         if not tokenizer_config.is_file() or not json.loads(tokenizer_config.read_text()).get(
