@@ -277,6 +277,24 @@ API, which calls are graphed and the ViT cache. [Validation
 results](docs/validation.md#inference-acceleration) list the measured latency
 and parity.
 
+## Streaming prefill simulation
+
+A streaming runtime recomputes only the text and the newest frame of each camera
+at each tick, and reuses every older image's K/V from the tick where that image
+was new. `alpamayo2_edge.streaming` reproduces that computation in PyTorch, so
+its effect can be measured against a full prefill:
+
+```bash
+python -m alpamayo2_edge.streaming \
+    --model-id "$EDGE_MODEL" \
+    --manifest examples/nav_samples.json \
+    --warmup-s 3.0 \
+    --output outputs/streaming
+```
+
+The [streaming guide](docs/streaming.md) describes the cache, why the simulation
+is the same function as the runtime's, and the Python API.
+
 For development, run `uv run --locked pytest`. See
 [validation results and reproduction commands](docs/validation.md) for the
 recorded EA checkpoint download and PhysicalAI-AV GPU inference checks.

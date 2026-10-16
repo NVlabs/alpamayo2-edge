@@ -112,6 +112,32 @@ class Alpamayo2Edge(PreTrainedModel):
     def tie_weights(self, *args: Any, **kwargs: Any) -> None:
         super().tie_weights(*args, **kwargs)
 
+    def prepare_tokenized_data(
+        self, data: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+        """Return the prompt the VLM reads, with history tokens fused in, and the history."""
+        tokenized_data = dict(data["tokenized_data"])
+        traj_data = {key: data[key] for key in ("ego_history_xyz", "ego_history_rot")}
+        input_ids = fuse_traj_tokens(
+            self.history_traj_tokenizer,
+            self.future_traj_tokenizer,
+            tokenized_data["input_ids"],
+            traj_data,
+            self.config.traj_ids,
+        )
+        tokenized_data["input_ids"] = input_ids
+        tokenized_data.setdefault("attention_mask", torch.ones_like(input_ids))
+        if "mm_token_type_ids" not in tokenized_data and (
+            "image_grid_thw" in tokenized_data or "video_grid_thw" in tokenized_data
+        ):
+            # Older packed fixtures omit this HF5 processor field. Without it,
+            # Qwen3-VL generation silently uses text positions for vision tokens.
+            token_types = torch.zeros_like(input_ids)
+            token_types[input_ids == self.config.vlm_config.image_token_id] = 1
+            token_types[input_ids == self.config.vlm_config.video_token_id] = 2
+            tokenized_data["mm_token_type_ids"] = token_types
+        return tokenized_data, traj_data
+
     def _generate_with_shared_prefill(
         self,
         tokenized_data: dict[str, Any],
@@ -229,26 +255,8 @@ class Alpamayo2Edge(PreTrainedModel):
                 raise ValueError(f"{name} must be a positive integer.")
         if max_generation_length is not None and max_generation_length < 1:
             raise ValueError("max_generation_length must be positive.")
-        tokenized_data = dict(data["tokenized_data"])
-        traj_data = {key: data[key] for key in ("ego_history_xyz", "ego_history_rot")}
-        input_ids = fuse_traj_tokens(
-            self.history_traj_tokenizer,
-            self.future_traj_tokenizer,
-            tokenized_data["input_ids"],
-            traj_data,
-            self.config.traj_ids,
-        )
-        tokenized_data["input_ids"] = input_ids
-        tokenized_data.setdefault("attention_mask", torch.ones_like(input_ids))
-        if "mm_token_type_ids" not in tokenized_data and (
-            "image_grid_thw" in tokenized_data or "video_grid_thw" in tokenized_data
-        ):
-            # Older packed fixtures omit this HF5 processor field. Without it,
-            # Qwen3-VL generation silently uses text positions for vision tokens.
-            token_types = torch.zeros_like(input_ids)
-            token_types[input_ids == self.config.vlm_config.image_token_id] = 1
-            token_types[input_ids == self.config.vlm_config.video_token_id] = 2
-            tokenized_data["mm_token_type_ids"] = token_types
+        tokenized_data, traj_data = self.prepare_tokenized_data(data)
+        input_ids = tokenized_data["input_ids"]
         batch_size, prompt_length = input_ids.shape
         n_samples_total = num_traj_sets * num_traj_samples
         anchor = self.config.traj_ids["future_start"]
