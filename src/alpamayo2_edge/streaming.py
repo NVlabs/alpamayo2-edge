@@ -241,14 +241,13 @@ class _SpliceHooks:
 class StreamingPrefill:
     """Replay a stream tick by tick, as a runtime with a per-image K/V cache computes it.
 
-    ``history_us`` is the camera history of a prompt: after each tick, frames older
-    than the tick time minus ``history_us`` can no longer appear and are evicted.
-    ``stream`` names the stream for ``image_frame_ids`` when samples carry no
+    At the start of each tick, frames captured before the oldest image of its prompt
+    are evicted: prompts only move forward in time, so those frames cannot appear
+    again. ``stream`` names the stream for ``image_frame_ids`` when samples carry no
     ``clip_id``.
     """
 
     model: Any
-    history_us: int = HISTORY_US
     stream: Hashable | None = None
     cache: ImageKVCache = field(default_factory=ImageKVCache)
 
@@ -292,10 +291,11 @@ class StreamingPrefill:
 
         Any inference that prefills ``prepared`` may run inside the block, for example
         ``sample_trajectories_from_data``. On a clean exit the recomputed images' K/V
-        enter the cache and frames that fell out of the history are evicted. With
+        enter the cache, which then holds every image of this prompt. With
         ``reuse=False`` every image is recomputed, as in a full prefill.
         """
         plan = self.plan(sample, prepared)
+        self.cache.evict_before(min(frame_id[2] for frame_id in plan.frame_ids))
         if not reuse:
             plan = TickPlan(
                 plan.frame_ids,
@@ -312,8 +312,6 @@ class StreamingPrefill:
             raise RuntimeError("no forward of the whole prompt ran inside StreamingPrefill.tick")
         for frame_id, frame in hooks.frames().items():
             self.cache.put(frame_id, frame)
-        tick_us = max(frame_id[2] for frame_id in plan.frame_ids)
-        self.cache.evict_before(tick_us - self.history_us)
 
     def advance(self, sample: Mapping[str, Any], prepared: Mapping[str, Any]) -> TickPlan:
         """Run one tick's prompt prefill and update the cache, without decoding."""

@@ -43,7 +43,10 @@ language-model layer:
   RoPE at the current positions, which is the runtime's rotation to the new slot;
 - the same rows of every recomputed image are captured into the cache, keyed by
   `image_frame_ids` (stream, camera, capture time);
-- after the tick, frames captured more than two seconds before it are evicted.
+- at the start of each tick, frames captured before the oldest image of its prompt
+  are evicted; prompts only move forward in time, so those frames cannot appear
+  again. This needs no time margin for decoded capture times that precede the
+  requested ones.
 
 Tokens interact only through attention K and V. Once an image's K/V rows are
 replaced in every layer, its own hidden states reach no other token, so running

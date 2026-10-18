@@ -17,7 +17,6 @@ PATCH_DIM = 3 * 2 * 2 * 2
 TICK = 100_000
 # Camera 1 keeps three frames, camera 6 two, as the front and side cameras do.
 SCHEDULE = {1: ((1, 4, 4), (-200_000, -100_000, 0)), 6: ((1, 4, 6), (-100_000, 0))}
-HISTORY = 200_000
 
 
 def _tiny_model(monkeypatch):
@@ -114,16 +113,18 @@ def _frame_pixels(camera: int, time_us: int, grid) -> torch.Tensor:
     return torch.randn(grid[0] * grid[1] * grid[2], PATCH_DIM, generator=generator)
 
 
-def _tick(t_us: int, noise_before: int | None = None):
+def _tick(t_us: int, noise_before: int | None = None, early_us: int = 0):
     """A raw sample (frame IDs) and model inputs whose frame pixels depend only on the frame.
 
     With ``noise_before``, frames captured before that time get unrelated pixels.
+    ``early_us`` makes camera 1's captures precede their requested times, as decoded
+    frames do; camera 6's newest frame stays at the tick time.
     """
     cameras, times, grids, pixels = [], [], [], []
     ids = [1]
     for camera, (grid, offsets) in SCHEDULE.items():
         for offset in offsets:
-            time_us = t_us + offset
+            time_us = t_us + offset - (early_us if camera == 1 else 0)
             cameras.append(camera)
             times.append(time_us)
             grids.append(grid)
@@ -187,7 +188,7 @@ def test_image_spans_and_ticks():
 def test_cold_tick_is_the_full_prefill_and_fills_the_cache(monkeypatch):
     model = _tiny_model(monkeypatch)
     sample, prepared = _tick(1_000_000)
-    stream = StreamingPrefill(model, history_us=HISTORY)
+    stream = StreamingPrefill(model)
     with stream.tick(sample, prepared) as plan:
         streamed = _sample(model, prepared)
     _assert_same(streamed, _sample(model, prepared))
@@ -202,7 +203,7 @@ def test_cold_tick_is_the_full_prefill_and_fills_the_cache(monkeypatch):
 def test_splicing_a_tick_into_itself_is_exact(monkeypatch):
     model = _tiny_model(monkeypatch)
     sample, prepared = _tick(1_000_000)
-    stream = StreamingPrefill(model, history_us=HISTORY)
+    stream = StreamingPrefill(model)
     stream.advance(sample, prepared)
     with stream.tick(sample, prepared) as plan:
         spliced = _sample(model, prepared)
@@ -215,7 +216,7 @@ def test_reused_images_reach_no_other_token(monkeypatch):
     model = _tiny_model(monkeypatch)
     sample, prepared = _tick(1_000_000)
     _, noisy = _tick(1_000_000, noise_before=1_000_000)
-    stream = StreamingPrefill(model, history_us=HISTORY)
+    stream = StreamingPrefill(model)
     stream.advance(sample, prepared)
     with stream.tick(sample, noisy) as plan:
         with_noise = _sample(model, noisy)
@@ -232,7 +233,7 @@ def test_reused_images_reach_no_other_token(monkeypatch):
 
 def test_stream_reuses_older_frames_with_stale_context(monkeypatch):
     model = _tiny_model(monkeypatch)
-    stream = StreamingPrefill(model, history_us=HISTORY)
+    stream = StreamingPrefill(model)
     stream.advance(*_tick(1_000_000))
     sample, prepared = _tick(1_100_000)
     plan = stream.advance(sample, prepared)
@@ -248,7 +249,7 @@ def test_stream_reuses_older_frames_with_stale_context(monkeypatch):
     assert ("stream", 1, 800_000) not in stream.cache
     assert len(stream.cache) == 6
 
-    reference = StreamingPrefill(model, history_us=HISTORY)
+    reference = StreamingPrefill(model)
     reference.advance(sample, prepared)
     older = [plan.frame_ids[i] for i in plan.reused]
     rows = kv_difference(reference.cache, stream.cache, older)
@@ -261,9 +262,9 @@ def test_stream_reuses_older_frames_with_stale_context(monkeypatch):
 def test_cached_keys_precede_rope(monkeypatch):
     """A frame's first-layer K is the same in any slot, so positions come from the current tick."""
     model = _tiny_model(monkeypatch)
-    first = StreamingPrefill(model, history_us=HISTORY)
+    first = StreamingPrefill(model)
     first.advance(*_tick(1_000_000))
-    second = StreamingPrefill(model, history_us=HISTORY)
+    second = StreamingPrefill(model)
     sample, prepared = _tick(1_100_000)
     plan = second.advance(sample, prepared)
     frame_id = ("stream", 1, 1_000_000)
@@ -274,9 +275,23 @@ def test_cached_keys_precede_rope(monkeypatch):
     )
 
 
+def test_captures_that_precede_their_request_stay_cached(monkeypatch):
+    """Decoded frames can be slightly older than requested; no frame in use is evicted."""
+    model = _tiny_model(monkeypatch)
+    stream = StreamingPrefill(model)
+    for t_us in (1_000_000, 1_100_000):
+        stream.advance(*_tick(t_us, early_us=7_000))
+    sample, prepared = _tick(1_200_000, early_us=7_000)
+    with stream.tick(sample, prepared) as plan:
+        _prompt_hidden(model, prepared)
+    assert plan.missing == () and len(plan.reused) == 3
+    assert all(frame_id in stream.cache for frame_id in plan.frame_ids)
+    assert ("stream", 1, 893_000) not in stream.cache
+
+
 def test_gaps_recompute_the_missing_frames(monkeypatch):
     model = _tiny_model(monkeypatch)
-    stream = StreamingPrefill(model, history_us=HISTORY)
+    stream = StreamingPrefill(model)
     stream.advance(*_tick(1_000_000))
     plan = stream.advance(*_tick(1_200_000))
     assert [plan.frame_ids[i][1:] for i in plan.missing] == [(1, 1_100_000), (6, 1_100_000)]
@@ -286,7 +301,7 @@ def test_gaps_recompute_the_missing_frames(monkeypatch):
 
 def test_a_tick_without_a_prompt_forward_is_an_error(monkeypatch):
     model = _tiny_model(monkeypatch)
-    stream = StreamingPrefill(model, history_us=HISTORY)
+    stream = StreamingPrefill(model)
     with pytest.raises(RuntimeError, match="no forward"):
         with stream.tick(*_tick(1_000_000)):
             pass
