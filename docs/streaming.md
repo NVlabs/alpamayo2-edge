@@ -80,7 +80,8 @@ print(plan.summary())  # prompt, reused and recomputed tokens; frames missing fr
   relative L1 and relative L2 per layer for K and V.
 - `stream_ticks_us(t0_us, warmup_us)` lists the tick times of a stream that starts
   cold `warmup_us` before `t0_us`. A warm-up of at least two seconds fills the
-  cache; three seconds also lets the cold-start frames age out.
+  cache by `t0`. The cold-start tick needs its own two-second camera history, so
+  the warm-up can be at most `t0` minus two seconds.
 - Samples need `camera_indices` and `absolute_timestamps`, as
   `load_physical_aiavdataset` returns, and a `clip_id` or an explicit
   `StreamingPrefill(model, stream=...)` name.
@@ -91,9 +92,12 @@ print(plan.summary())  # prompt, reused and recomputed tokens; frames missing fr
 python -m alpamayo2_edge.streaming \
     --model-id "$EDGE_MODEL" \
     --manifest examples/nav_samples.json \
-    --warmup-s 3.0 \
+    --warmup-s 2.0 \
     --output outputs/streaming
 ```
+
+The example's `t0` is 4.0 seconds, so a two-second warm-up is the longest it
+allows; for a later `t0`, `--warmup-s 3.0` (the default) is also possible.
 
 The command loads every 0.1 s tick from the cold start to `t0` through
 PhysicalAI-AV, replays the stream, then runs inference at `t0` twice with the same

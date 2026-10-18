@@ -414,7 +414,8 @@ def main(argv=None) -> None:
         "--warmup-s",
         type=float,
         default=3.0,
-        help="Start the stream cold this many seconds before t0 (at least 2 s fills the cache)",
+        help="Start the stream cold this many seconds before t0: at least 2 s fills the cache, "
+        "and t0 minus the warm-up must leave the 2 s camera history",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")

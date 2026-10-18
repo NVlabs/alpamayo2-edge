@@ -288,7 +288,7 @@ its effect can be measured against a full prefill:
 python -m alpamayo2_edge.streaming \
     --model-id "$EDGE_MODEL" \
     --manifest examples/nav_samples.json \
-    --warmup-s 3.0 \
+    --warmup-s 2.0 \
     --output outputs/streaming
 ```
 
