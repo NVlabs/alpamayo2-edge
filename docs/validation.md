@@ -3,7 +3,7 @@
 
 # Checkpoint validation
 
-The results below record checks performed on 2026-10-07 and 2026-10-08. They
+The results below record checks performed on 2026-10-07, 2026-10-08 and 2026-10-22. They
 are historical measurements, not a fresh validation of every later code revision. The commands
 use the supported PhysicalAI-AV input path with local or Hugging Face model
 assets.
@@ -293,6 +293,30 @@ embedding in both arms), it took 749 ms instead of 1,615 ms. These numbers come
 from a different pipeline and Transformers version; they are context for the
 measurements above, not a substitute for them.
 
+## Course-heading action space
+
+On 2026-10-22, `UnicycleAccelCurvatureCourseActionSpace` was compared with the
+training implementation and run with a local copy of an unpublished
+course-heading checkpoint:
+
+- On CPU in FP32, encoding, `t0` states and decoding were bitwise equal to the
+  training implementation, both for the 12 test scenarios and for 1,000 random
+  trajectories, including histories stored in BF16. Decoding covered encoded
+  futures and arbitrary actions decoded from the full history, as inference
+  does. The yaw-heading space's outputs were bitwise unchanged from the
+  previous revision.
+- The checkpoint's config normalized with both action spaces (the future
+  trajectory tokenizer's and the expert's) instantiated as the course-heading
+  class with every saved parameter, including `slip_gradient` 2.5e-3 and
+  `theta_lambda` 3e-6. `load_model` reported no missing, unexpected, or
+  mismatched keys, and the checkpoint's config was unchanged.
+- The checkpoint's tokenizer, processor, generation config and chat template
+  are byte-identical to EA's, so the packed inputs of the
+  [public navigation example](#public-physicalai-av-navigation-example) were
+  reused. FP32 CPU inference with the CLI sampling settings produced six finite
+  trajectories shaped `[1, 6, 1, 64, 3]`. This is an execution check, not a
+  quality measurement.
+
 ## CPU tests
 
 Install the development and dataset dependencies, then run the CPU suite:
@@ -310,3 +334,13 @@ inclusive time bounds, missing optional dependencies, and manifest navigation
 selection and overrides. They use test fixtures and mocked dataset access; an
 actual checkpoint and dataset execution is checked with the navigation command
 above.
+
+Action-space tests compare encoding and decoding by both trajectory action
+spaces with outputs recorded from the training implementation
+(`tests/data/course_action_space_reference.safetensors`). To also check that a
+local checkpoint's saved action-space parameters survive config normalization,
+point `ALPAMAYO2_EDGE_CHECKPOINT` at its model directory:
+
+```bash
+ALPAMAYO2_EDGE_CHECKPOINT=/path/to/model uv run --locked pytest tests/test_config.py
+```

@@ -12,6 +12,7 @@ _TARGETS = {
     "alpamayo.tokenizer.trajectory.delta_tokenizer.DeltaTrajectoryTokenizer": "alpamayo2_edge.models.delta_tokenizer.DeltaTrajectoryTokenizer",
     "alpamayo.action_space.discrete_action_space.DiscreteTrajectoryTokenizer": "alpamayo2_edge.action_space.discrete_action_space.DiscreteTrajectoryTokenizer",
     "alpamayo.action_space.UnicycleAccelCurvatureActionSpace": "alpamayo2_edge.action_space.UnicycleAccelCurvatureActionSpace",
+    "alpamayo.action_space.UnicycleAccelCurvatureCourseActionSpace": "alpamayo2_edge.action_space.UnicycleAccelCurvatureCourseActionSpace",
     "alpamayo.diffusion.flow_matching.FlowMatching": "alpamayo2_edge.diffusion.flow_matching.FlowMatching",
     "reasoning_vla.submodules.action_in_proj.PerWaypointActionInProjV2": "alpamayo2_edge.models.action_in_proj.PerWaypointActionInProjV2",
 }

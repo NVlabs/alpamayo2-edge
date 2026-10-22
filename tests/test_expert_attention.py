@@ -212,12 +212,19 @@ def test_expert_state_dict_preserves_attention_and_action_projection_geometry():
     assert incompatible.unexpected_keys == []
 
 
-def test_expert_pretrained_roundtrip_reconstructs_constants_and_preserves_weights(tmp_path):
+@pytest.mark.parametrize(
+    "action_space",
+    ["UnicycleAccelCurvatureActionSpace", "UnicycleAccelCurvatureCourseActionSpace"],
+)
+def test_expert_pretrained_roundtrip_reconstructs_constants_and_preserves_weights(
+    tmp_path, action_space
+):
     from safetensors import safe_open
 
     from alpamayo2_edge.models.expert import ExpertModel
 
     config = _expert_config()
+    config.action_space_cfg["_target_"] = f"alpamayo2_edge.action_space.{action_space}"
     normalization = {
         "accel_mean": 1.25,
         "accel_std": 2.5,
@@ -232,6 +239,7 @@ def test_expert_pretrained_roundtrip_reconstructs_constants_and_preserves_weight
         tmp_path, local_files_only=True, output_loading_info=True
     )
     assert not any(loading_info.values()), loading_info
+    assert type(restored.action_space).__name__ == action_space
 
     original_parameters = dict(original.named_parameters())
     restored_parameters = dict(restored.named_parameters())
