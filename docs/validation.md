@@ -46,6 +46,42 @@ audits are `.work/ea-release/upload-result.json` and
 `.work/ea-release/fresh-vs-original-public-nav.json`. Use the
 [README example](../README.md#run-a-physicalai-av-navigation-example) to reproduce.
 
+## GA repository download and inference
+
+On 2026-10-22, the GA checkpoint was uploaded to
+[nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge/tree/eb341e482bddddc2f6a7bc963f0a0ce1091481b6),
+revision `eb341e482bddddc2f6a7bc963f0a0ce1091481b6`. It was staged like EA: the
+configuration received the same release renames, including the standalone
+course-heading action-space target, and all 195 numerical/Boolean values are
+unchanged. Weight shards, tokenizer, processors, generation config, and chat
+template are byte-identical to the training checkpoint. Compared with EA's
+published configuration, only the action-space class, `slip_gradient` (2.5e-3)
+and `theta_lambda` (3e-6) differ in both action-space blocks, plus an unused
+`enable_thinking: null` field. Hugging Face metadata for all 15 uploaded files
+matched the staged files, and a download of the revision into empty caches
+matched every staged SHA256.
+
+The CLI then ran the [public navigation example](#public-physicalai-av-navigation-example)
+with the repository ID and immutable revision, starting from empty HF Hub and Xet
+caches, on H100 80GB with BF16 and SDPA and with the settings and dataset revision
+of the EA check above. Six reasoning continuations each produced one finite
+trajectory, shaped `[1, 6, 1, 64, 3]` and `[1, 6, 1, 64, 3, 3]`, and loading
+reported no missing, unexpected, or mismatched keys and no errors. Because the
+published assets equal the training checkpoint's except for the renamed config,
+this also covers the original checkpoint. This verifies downloading, loading,
+and inference; it does not establish benchmark quality.
+
+In the same job, the EA checkpoint ran with the `ea-release` code and with this
+revision's code. Packed inputs, generated token IDs, and trajectories were bitwise
+equal, so the yaw-heading path is unchanged on the GPU as well as on the CPU. For
+this example and seed, GA generated the same token IDs as EA although all 947
+weight tensors differ; its trajectories differed from EA's by up to 1.05 m within
+6.4 seconds.
+
+Local evidence is in `.work/ga-release/`: `staging-report.json`,
+`upload-result.json`, `fresh-download-sha256.json`, and, for the GPU job,
+`gpu-check/summary.json` with each run's `report.json`.
+
 ## Public PhysicalAI-AV navigation example
 
 On 2026-10-07, the CLI also ran end to end from the public PhysicalAI-AV SDK on
@@ -296,8 +332,8 @@ measurements above, not a substitute for them.
 ## Course-heading action space
 
 On 2026-10-22, `UnicycleAccelCurvatureCourseActionSpace` was compared with the
-training implementation and run with a local copy of an unpublished
-course-heading checkpoint:
+training implementation and run with the GA training checkpoint before its
+upload:
 
 - On CPU in FP32, encoding, `t0` states and decoding were bitwise equal to the
   training implementation, both for the 12 test scenarios and for 1,000 random
