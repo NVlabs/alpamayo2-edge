@@ -1,7 +1,7 @@
 """Course-heading action space: parity with the training implementation and inference contract.
 
-``data/course_action_space_reference.safetensors`` holds the training code's encode/decode outputs
-for the scenarios below. Regenerate it with the Alpamayo training package importable:
+``data/course_action_space_reference.safetensors`` holds the training code's float64 encode/decode
+outputs for the scenarios below. Regenerate it with the Alpamayo training package importable:
 
     PYTHONPATH=src:/path/to/alpamayo/src python tests/test_course_action_space.py
 """
@@ -37,6 +37,14 @@ _COMMON = {
 }
 YAW_CFG = {**_COMMON, "theta_lambda": 1e-6}
 COURSE_CFG = {**_COMMON, "theta_lambda": 3e-6, "slip_gradient": 2.5e-3}
+
+# Float64 solves agree across LAPACK builds to ~1e-12. Float32 solves of these smoothing systems
+# differ from float64 by up to ~1e-3 normalized action units and vary with the LAPACK kernel, so
+# float32 (the inference precision) is checked against the float64 reference at these bounds.
+TOLERANCES = {
+    torch.float64: {"action": 1e-9, "xyz": 1e-9, "yaw": 1e-9, "t0": 1e-9},
+    torch.float32: {"action": 5e-3, "xyz": 5e-4, "yaw": 1e-4, "t0": 5e-5},
+}
 
 
 def _hash_noise(index: torch.Tensor, seed: float) -> torch.Tensor:
@@ -126,25 +134,26 @@ def _scenario(
         xy[t0 - 1, 1] += history_shift
     if future_shift is not None:
         xy[t0 + 1 + future_shift[0], 1] += future_shift[1]
-    xyz = torch.cat([xy, torch.zeros_like(xy[:, :1])], -1).float()
-    rot = _rotation(yaw, *pitch_roll).float()
+    xyz = torch.cat([xy, torch.zeros_like(xy[:, :1])], -1)
+    rot = _rotation(yaw, *pitch_roll)
     return xyz[:HISTORY_STEPS], rot[:HISTORY_STEPS], xyz[HISTORY_STEPS:], rot[HISTORY_STEPS:]
 
 
-def scenario_batch() -> dict[str, torch.Tensor]:
-    """All scenarios stacked, plus a deterministic sampled action for each."""
+def scenario_batch(dtype: torch.dtype = torch.float32) -> dict[str, torch.Tensor]:
+    """All scenarios stacked, plus a deterministic sampled action for each, in ``dtype``."""
     parts = [_scenario(i, **kwargs) for i, kwargs in enumerate(SCENARIOS.values())]
     hist_xyz, hist_rot, fut_xyz, fut_rot = (torch.stack(p) for p in zip(*parts, strict=True))
     k = torch.arange(FUTURE_STEPS, dtype=torch.float32)
     b = torch.arange(len(SCENARIOS), dtype=torch.float32)[:, None]
     sampled = torch.stack([1.5 * torch.sin(0.1 * k + b), 2.0 * torch.cos(0.07 * k + 0.5 * b)], -1)
-    return {
+    batch = {
         "hist_xyz": hist_xyz,
         "hist_rot": hist_rot,
         "fut_xyz": fut_xyz,
         "fut_rot": fut_rot,
         "sampled_action": sampled,
     }
+    return {key: value.to(dtype) for key, value in batch.items()}
 
 
 def _yaw(rot: torch.Tensor) -> torch.Tensor:
@@ -177,8 +186,9 @@ def reference() -> dict[str, torch.Tensor]:
     return load_file(DATA)
 
 
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
 @pytest.mark.parametrize("prefix", ["course", "yaw"])
-def test_encode_and_decode_match_training_implementation(reference, prefix):
+def test_encode_and_decode_match_training_implementation(reference, prefix, dtype):
     from alpamayo2_edge.action_space import (
         UnicycleAccelCurvatureActionSpace,
         UnicycleAccelCurvatureCourseActionSpace,
@@ -189,15 +199,18 @@ def test_encode_and_decode_match_training_implementation(reference, prefix):
         if prefix == "course"
         else UnicycleAccelCurvatureActionSpace(**YAW_CFG)
     )
-    actual = compute_outputs(space, scenario_batch(), prefix)
+    actual = compute_outputs(space, scenario_batch(dtype), prefix)
     expected = {key: value for key, value in reference.items() if key.startswith(f"{prefix}.")}
     assert actual.keys() == expected.keys()
     for key, value in expected.items():
-        if key.endswith("_yaw"):
-            _angle_close(actual[key], value, atol=1e-5, msg=key)
+        kind = key.rsplit(".", 1)[1]
+        kind = "t0" if kind.startswith("t0_") else kind.rsplit("_", 1)[-1]
+        atol = TOLERANCES[dtype][kind]
+        if kind == "yaw":
+            _angle_close(actual[key].double(), value, atol=atol, msg=key)
         else:
-            # Positions [m], speed [m/s], course [rad] and normalized actions.
-            torch.testing.assert_close(actual[key], value, rtol=0, atol=1e-4, msg=key)
+            # Normalized actions, positions [m], t0 speed [m/s] and course [rad].
+            torch.testing.assert_close(actual[key].double(), value, rtol=0, atol=atol, msg=key)
 
 
 def test_course_and_yaw_spaces_differ_on_these_scenarios(reference):
@@ -261,7 +274,7 @@ def _write_reference(path: Path) -> None:
     )
     from safetensors.torch import save_file
 
-    inputs = scenario_batch()
+    inputs = scenario_batch(torch.float64)
     outputs = {
         **compute_outputs(UnicycleAccelCurvatureCourseActionSpace(**COURSE_CFG), inputs, "course"),
         **compute_outputs(UnicycleAccelCurvatureActionSpace(**YAW_CFG), inputs, "yaw"),
@@ -274,6 +287,7 @@ def _write_reference(path: Path) -> None:
         str(path),
         metadata={
             "source": "alpamayo.action_space",
+            "dtype": "float64",
             "torch": torch.__version__,
             "scenarios": ",".join(SCENARIOS),
         },

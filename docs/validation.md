@@ -372,8 +372,13 @@ actual checkpoint and dataset execution is checked with the navigation command
 above.
 
 Action-space tests compare encoding and decoding by both trajectory action
-spaces with outputs recorded from the training implementation
-(`tests/data/course_action_space_reference.safetensors`). To also check that a
+spaces with float64 outputs recorded from the training implementation
+(`tests/data/course_action_space_reference.safetensors`). The float64 comparison
+uses a 1e-9 tolerance: float64 solves agree across LAPACK builds to about 1e-12.
+The float32 comparison uses bounds of 5e-3 normalized action units, 0.5 mm, and
+0.1 mrad, because float32 solves of the smoothing systems differ from float64
+by up to about 1e-3 action units, and by different amounts on different LAPACK
+kernels. To also check that a
 local checkpoint's saved action-space parameters survive config normalization,
 point `ALPAMAYO2_EDGE_CHECKPOINT` at its model directory:
 
