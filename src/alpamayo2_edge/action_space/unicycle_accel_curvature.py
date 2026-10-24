@@ -39,6 +39,9 @@ _LOW_SPEED_CURVATURE_THRESHOLD_MPS = 0.6
 class UnicycleAccelCurvatureActionSpace(ActionSpace):
     """Unicycle Kinematic Model with acceleration and curvature as control inputs."""
 
+    # Encoded curvature is zeroed on steps that start or end below this speed [m/s].
+    low_speed_curvature_threshold_mps: float = _LOW_SPEED_CURVATURE_THRESHOLD_MPS
+
     def __init__(
         self,
         accel_mean: float = 0.0,
@@ -206,8 +209,8 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
             ridge=self.kappa_ridge,
             dt=self.dt,
         )
-        low_speed = (v[..., :-1].abs() < _LOW_SPEED_CURVATURE_THRESHOLD_MPS) | (
-            v[..., 1:].abs() < _LOW_SPEED_CURVATURE_THRESHOLD_MPS
+        low_speed = (v[..., :-1].abs() < self.low_speed_curvature_threshold_mps) | (
+            v[..., 1:].abs() < self.low_speed_curvature_threshold_mps
         )
         kappa = kappa.clamp(min=self.curvature_bounds[0], max=self.curvature_bounds[1])
         return torch.where(low_speed, torch.zeros_like(kappa), kappa)
@@ -228,6 +231,52 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
         )  # (..., N+1)
         v_t0 = v[..., -1]
         return {"v": v_t0}
+
+    def _initial_heading(self, t0_states: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Heading [rad] at t0 that encoding and decoding start from: the t0 rig yaw, 0.
+
+        Args:
+            t0_states: output of ``estimate_t0_states``.
+
+        Returns:
+            (...,) zeros.
+        """
+        return torch.zeros_like(t0_states["v"])
+
+    def _heading_targets(
+        self,
+        traj_history_xyz: torch.Tensor,
+        traj_history_rot: torch.Tensor,
+        traj_future_xyz: torch.Tensor,
+        traj_future_rot: torch.Tensor,
+    ) -> torch.Tensor:
+        """Heading targets [rad] at future steps 1..N for encoding: the unwrapped body yaw.
+
+        Args:
+            traj_history_xyz: (..., T_hist, 3) in the t0 rig frame.
+            traj_history_rot: (..., T_hist, 3, 3)
+            traj_future_xyz: (..., N, 3)
+            traj_future_rot: (..., N, 3, 3)
+
+        Returns:
+            (..., N) heading targets.
+        """
+        return unwrap_angle(so3_to_yaw_torch(traj_future_rot))
+
+    def _output_heading(
+        self, theta: torch.Tensor, velocity: torch.Tensor, t0_states: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Heading [rad] of the decoded rotations: the integrated heading itself.
+
+        Args:
+            theta: (..., N+1) integrated heading at steps 0..N.
+            velocity: (..., N+1) signed speed [m/s] at steps 0..N (negative when reversing).
+            t0_states: output of ``estimate_t0_states``.
+
+        Returns:
+            (..., N+1) ``theta``.
+        """
+        return theta
 
     @torch.no_grad()
     @torch._dynamo.disable()
@@ -250,7 +299,9 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
             traj_history_rot: (..., T, 3, 3)
             traj_future_xyz: (..., T, 3)
             traj_future_rot: (..., T, 3, 3)
-            t0_states: initial state estimate
+            t0_states: initial state estimate from ``estimate_t0_states`` (estimated from the
+                history when None); subclasses may need extra keys, e.g. the course-heading
+                space's ``theta``
             output_all_states: whether to output all the states
 
         Returns:
@@ -275,7 +326,10 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
 
         dxy = full_xy[..., 1:, :] - full_xy[..., :-1, :]  # (..., N, 2)
         theta = theta_smooth(
-            traj_future_rot=traj_future_rot,
+            theta=self._heading_targets(
+                traj_history_xyz, traj_history_rot, traj_future_xyz, traj_future_rot
+            ),
+            theta_init=self._initial_heading(t0_states),
             dt=self.dt,
             theta_lambda=self.theta_lambda,
             theta_ridge=self.theta_ridge,
@@ -318,11 +372,14 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
             action: (..., T, 2)
             traj_history_xyz: (..., T, 3)
             traj_history_rot: (..., T, 3, 3)
-            t0_states: initial state estimate
+            t0_states: initial state estimate from ``estimate_t0_states`` (estimated from the
+                history when None); subclasses may need extra keys, e.g. the course-heading
+                space's ``theta``
 
         Returns:
             traj_future_xyz: (..., T, 3)
-            traj_future_rot: (..., T, 3, 3)
+            traj_future_rot: (..., T, 3, 3) rotations of ``_output_heading``, by default the
+                integrated heading, i.e. the quantity ``_heading_targets`` encodes.
         """
         accel, kappa = action[..., 0], action[..., 1]
 
@@ -347,7 +404,7 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
             ],
             dim=-1,
         )  # (..., N+1)
-        initial_yaw = torch.zeros_like(v0)
+        initial_yaw = self._initial_heading(t0_states)
         theta = torch.cat(
             [
                 initial_yaw.unsqueeze(-1),
@@ -385,6 +442,7 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
         # Handle only_xy case for output
         traj_future_xyz[..., 2] = traj_history_xyz[..., -1:, 2]
 
-        traj_future_rot = rot_2d_to_3d(rotation_matrix_torch(theta[..., 1:]))
+        output_heading = self._output_heading(theta, velocity, t0_states)
+        traj_future_rot = rot_2d_to_3d(rotation_matrix_torch(output_heading[..., 1:]))
 
         return traj_future_xyz, traj_future_rot

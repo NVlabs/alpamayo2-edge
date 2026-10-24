@@ -17,7 +17,7 @@ import einops
 import torch
 
 from alpamayo2_edge.common import logging
-from alpamayo2_edge.geometry.rotation import round_2pi_torch, so3_to_yaw_torch
+from alpamayo2_edge.geometry.rotation import round_2pi_torch
 
 logger = logging.RankedLogger(__name__, rank_zero_only=False)
 logger.setLevel("INFO")
@@ -489,19 +489,24 @@ def dxy_theta_to_v(
 @torch.amp.autocast(device_type="cuda", enabled=False)
 @torch._dynamo.disable()
 def theta_smooth(
-    traj_future_rot: torch.Tensor,
+    theta: torch.Tensor,
+    theta_init: torch.Tensor,
     dt: float = 1.0,
     theta_lambda: float = 1e-4,
     theta_ridge: float = 1e-4,
 ) -> torch.Tensor:
-    """Smooth the heading of the trajectory.
+    """Fit a heading sequence with a third-order smoothness penalty, holding the t0 heading fixed.
 
     Args:
-        traj_future_rot: (..., T, 3, 3)
+        theta: (..., T) unwrapped heading targets [rad] at steps 1..T.
+        theta_init: (...,) heading [rad] at step 0.
+        dt: time step [s].
+        theta_lambda: weight of the smoothness term.
+        theta_ridge: ridge regularization weight.
+
+    Returns:
+        (..., T+1) smoothed heading [rad], starting with ``theta_init``.
     """
-    theta = so3_to_yaw_torch(traj_future_rot)
-    theta = unwrap_angle(theta)
-    theta_init = torch.zeros_like(theta[..., 0])
     return solve_single_constraint(
         x_init=theta_init,
         x_target=theta,

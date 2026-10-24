@@ -8,9 +8,18 @@ trajectory diffusion expert. Given six-camera observations, ego history, and a
 navigation instruction, the model generates driving reasoning and 64 future poses
 at 0.1-second intervals.
 
-Early-access weights are hosted at
-[nvidia/EA-Alpamayo2-Edge](https://huggingface.co/nvidia/EA-Alpamayo2-Edge).
-Model access requires an authorized Hugging Face account.
+Model access requires an authorized Hugging Face account. The commands below use
+the GA checkpoint; the early-access (EA) checkpoint also runs with this code.
+
+| Release | Weights | Code | Trajectory heading |
+| --- | --- | --- | --- |
+| GA | [nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge) | `ga-release` or later | Course: the rear axle's direction of travel |
+| EA | [nvidia/EA-Alpamayo2-Edge](https://huggingface.co/nvidia/EA-Alpamayo2-Edge) | `ea-release` or later | Body yaw |
+
+Each checkpoint's configuration selects its trajectory action space. With the GA
+checkpoint, decoded positions follow the course and decoded rotations estimate the
+body yaw, which differs from the path tangent by the rear-axle sideslip of the
+training vehicle. Code before `ga-release` rejects the GA configuration.
 
 ## Setup
 
@@ -42,8 +51,8 @@ source .venv/bin/activate
 hf auth login
 
 python -m alpamayo2_edge.inference \
-    --model-id nvidia/EA-Alpamayo2-Edge \
-    --revision b9d768920e925d8088afb2c628aa33acc3d36576 \
+    --model-id nvidia/Alpamayo2-Edge \
+    --revision eb341e482bddddc2f6a7bc963f0a0ce1091481b6 \
     --manifest examples/nav_samples.json \
     --output outputs/physicalai-nav
 ```
@@ -57,7 +66,7 @@ For a local checkpoint and an explicitly selected clip:
 
 ```bash
 python -m alpamayo2_edge.inference \
-    --model-id /path/to/EA-Alpamayo2-Edge \
+    --model-id /path/to/Alpamayo2-Edge \
     --clip-id ea7bbd31-b7a5-4972-8dbd-7089e6b53de4 \
     --t0-us 4000000 \
     --nav-text "Turn right in 30m" \
@@ -90,18 +99,18 @@ python - <<'PY'
 from huggingface_hub import snapshot_download
 
 snapshot_download(
-    repo_id="nvidia/EA-Alpamayo2-Edge",
-    revision="b9d768920e925d8088afb2c628aa33acc3d36576",
-    local_dir=".work/EA-Alpamayo2-Edge",
+    repo_id="nvidia/Alpamayo2-Edge",
+    revision="eb341e482bddddc2f6a7bc963f0a0ce1091481b6",
+    local_dir=".work/Alpamayo2-Edge",
 )
 PY
 
-export EDGE_MODEL="$PWD/.work/EA-Alpamayo2-Edge"
+export EDGE_MODEL="$PWD/.work/Alpamayo2-Edge"
 ```
 
 `$EDGE_MODEL` is the model directory itself. The loader resolves all tokenizer
 and processor assets from that directory, without fetching a separate backbone.
-The EA configuration uses the standalone `alpamayo2_edge` model identifiers.
+Both released configurations use the standalone `alpamayo2_edge` model identifiers.
 
 ## Sampling settings
 
@@ -185,7 +194,7 @@ sample = load_physical_aiavdataset(
     t0_us=4_000_000,
     nav_text="Turn right in 30m",
 )
-model, loading_info = load_model("nvidia/EA-Alpamayo2-Edge", device="cuda")
+model, loading_info = load_model("nvidia/Alpamayo2-Edge", device="cuda")
 inputs = to_device(prepare_model_inputs(sample, model.config, model.tokenizer), device="cuda")
 torch.manual_seed(43)
 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -279,7 +288,7 @@ and parity.
 
 For development, run `uv run --locked pytest`. See
 [validation results and reproduction commands](docs/validation.md) for the
-recorded EA checkpoint download and PhysicalAI-AV GPU inference checks.
+recorded EA and GA checkpoint download and PhysicalAI-AV GPU inference checks.
 Inference components are adapted from
 [Alpamayo 2 Super, commit 5e7975f](https://github.com/NVlabs/alpamayo2/tree/5e7975f4a2100ee8ac1a62b79239bbabefddcbef).
 Source code is distributed under [Apache-2.0](LICENSE); checkpoint access and its

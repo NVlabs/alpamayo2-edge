@@ -3,7 +3,7 @@
 
 # Checkpoint validation
 
-The results below record checks performed on 2026-10-07 and 2026-10-08. They
+The results below record checks performed on 2026-10-07, 2026-10-08 and 2026-10-22. They
 are historical measurements, not a fresh validation of every later code revision. The commands
 use the supported PhysicalAI-AV input path with local or Hugging Face model
 assets.
@@ -45,6 +45,42 @@ audits are `.work/ea-release/upload-result.json` and
 `.work/ea-release/fresh-download-sha256.json`; the before/after comparison is
 `.work/ea-release/fresh-vs-original-public-nav.json`. Use the
 [README example](../README.md#run-a-physicalai-av-navigation-example) to reproduce.
+
+## GA repository download and inference
+
+On 2026-10-22, the GA checkpoint was uploaded to
+[nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge/tree/eb341e482bddddc2f6a7bc963f0a0ce1091481b6),
+revision `eb341e482bddddc2f6a7bc963f0a0ce1091481b6`. It was staged like EA: the
+configuration received the same release renames, including the standalone
+course-heading action-space target, and all 195 numerical/Boolean values are
+unchanged. Weight shards, tokenizer, processors, generation config, and chat
+template are byte-identical to the training checkpoint. Compared with EA's
+published configuration, only the action-space class, `slip_gradient` (2.5e-3)
+and `theta_lambda` (3e-6) differ in both action-space blocks, plus an unused
+`enable_thinking: null` field. Hugging Face metadata for all 15 uploaded files
+matched the staged files, and a download of the revision into empty caches
+matched every staged SHA256.
+
+The CLI then ran the [public navigation example](#public-physicalai-av-navigation-example)
+with the repository ID and immutable revision, starting from empty HF Hub and Xet
+caches, on H100 80GB with BF16 and SDPA and with the settings and dataset revision
+of the EA check above. Six reasoning continuations each produced one finite
+trajectory, shaped `[1, 6, 1, 64, 3]` and `[1, 6, 1, 64, 3, 3]`, and loading
+reported no missing, unexpected, or mismatched keys and no errors. Because the
+published assets equal the training checkpoint's except for the renamed config,
+this also covers the original checkpoint. This verifies downloading, loading,
+and inference; it does not establish benchmark quality.
+
+In the same job, the EA checkpoint ran with the `ea-release` code and with this
+revision's code. Packed inputs, generated token IDs, and trajectories were bitwise
+equal, so the yaw-heading path is unchanged on the GPU as well as on the CPU. For
+this example and seed, GA generated the same token IDs as EA although all 947
+weight tensors differ; its trajectories differed from EA's by up to 1.05 m within
+6.4 seconds.
+
+Local evidence is in `.work/ga-release/`: `staging-report.json`,
+`upload-result.json`, `fresh-download-sha256.json`, and, for the GPU job,
+`gpu-check/summary.json` with each run's `report.json`.
 
 ## Public PhysicalAI-AV navigation example
 
@@ -293,6 +329,30 @@ embedding in both arms), it took 749 ms instead of 1,615 ms. These numbers come
 from a different pipeline and Transformers version; they are context for the
 measurements above, not a substitute for them.
 
+## Course-heading action space
+
+On 2026-10-22, `UnicycleAccelCurvatureCourseActionSpace` was compared with the
+training implementation and run with the GA training checkpoint before its
+upload:
+
+- On CPU in FP32, encoding, `t0` states and decoding were bitwise equal to the
+  training implementation, both for the 12 test scenarios and for 1,000 random
+  trajectories, including histories stored in BF16. Decoding covered encoded
+  futures and arbitrary actions decoded from the full history, as inference
+  does. The yaw-heading space's outputs were bitwise unchanged from the
+  previous revision.
+- The checkpoint's config normalized with both action spaces (the future
+  trajectory tokenizer's and the expert's) instantiated as the course-heading
+  class with every saved parameter, including `slip_gradient` 2.5e-3 and
+  `theta_lambda` 3e-6. `load_model` reported no missing, unexpected, or
+  mismatched keys, and the checkpoint's config was unchanged.
+- The checkpoint's tokenizer, processor, generation config and chat template
+  are byte-identical to EA's, so the packed inputs of the
+  [public navigation example](#public-physicalai-av-navigation-example) were
+  reused. FP32 CPU inference with the CLI sampling settings produced six finite
+  trajectories shaped `[1, 6, 1, 64, 3]`. This is an execution check, not a
+  quality measurement.
+
 ## CPU tests
 
 Install the development and dataset dependencies, then run the CPU suite:
@@ -310,3 +370,18 @@ inclusive time bounds, missing optional dependencies, and manifest navigation
 selection and overrides. They use test fixtures and mocked dataset access; an
 actual checkpoint and dataset execution is checked with the navigation command
 above.
+
+Action-space tests compare encoding and decoding by both trajectory action
+spaces with float64 outputs recorded from the training implementation
+(`tests/data/course_action_space_reference.safetensors`). The float64 comparison
+uses a 1e-9 tolerance: float64 solves agree across LAPACK builds to about 1e-12.
+The float32 comparison uses bounds of 5e-3 normalized action units, 0.5 mm, and
+0.1 mrad, because float32 solves of the smoothing systems differ from float64
+by up to about 1e-3 action units, and by different amounts on different LAPACK
+kernels. To also check that a
+local checkpoint's saved action-space parameters survive config normalization,
+point `ALPAMAYO2_EDGE_CHECKPOINT` at its model directory:
+
+```bash
+ALPAMAYO2_EDGE_CHECKPOINT=/path/to/model uv run --locked pytest tests/test_config.py
+```
