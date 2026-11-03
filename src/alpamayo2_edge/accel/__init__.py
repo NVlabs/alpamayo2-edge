@@ -4,10 +4,8 @@
 """Opt-in inference acceleration for Alpamayo 2 Edge.
 
 ``enable_acceleration`` installs ``torch.compile`` plus CUDA graphs on one loaded
-model: the vision tower, the prompt prefill, CoT decoding with a graphed sampler
-and the whole flow-matching loop. ``VisionFeatureCache`` reuses vision features
-across consecutive streaming calls, and ``use_linear_patch_embedding`` computes the
-patch embedding as a GEMM. Nothing here changes the default inference path.
+model: the prompt prefill, CoT decoding with a graphed sampler and the whole
+flow-matching loop. Nothing here changes the default inference path.
 """
 
 import warnings
@@ -20,9 +18,6 @@ from alpamayo2_edge.accel.decode import DecodeAccelerator, FlashKVCache
 from alpamayo2_edge.accel.expert import ExpertAccelerator
 from alpamayo2_edge.accel.graphs import AccelStats
 from alpamayo2_edge.accel.kernels import ATTENTION_CHOICES, PARTS, resolve_kernels
-from alpamayo2_edge.accel.patch_embed import use_linear_patch_embedding
-from alpamayo2_edge.accel.vision import VisionAccelerator
-from alpamayo2_edge.accel.vit_cache import VisionFeatureCache, image_frame_ids
 
 MODES = ("compile", "tuned")
 # Inductor mode of the decode step; every other part uses the default mode.
@@ -55,7 +50,7 @@ class AccelConfig:
 
     ``mode="tuned"`` compiles the decode step with inductor's
     ``max-autotune-no-cudagraphs`` mode, and ``"compile"`` uses the default mode
-    everywhere. ``attention`` selects the vision and prefill kernel: ``"auto"`` uses
+    everywhere. ``attention`` selects the prefill kernel: ``"auto"`` uses
     FlashAttention 3 on Hopper when it is installed, and PyTorch SDPA otherwise.
     Decode and expert attention always use FlashAttention 2 ``flash_attn_with_kvcache``.
     Shapes are bucketed to ``kv_bucket`` tokens. ``warmup`` eager runs precede each
@@ -138,15 +133,14 @@ def enable_acceleration(model: torch.nn.Module, config: AccelConfig | None = Non
 
     The first call for each new shape compiles and captures graphs inline (tens of
     seconds); later calls replay them. Inputs outside the supported envelope run
-    the original eager code, counted in ``handle.describe()["fallbacks"]``. Parts
-    that cannot run here (for example without FlashAttention 2) stay eager: they are
-    listed in ``handle.skipped`` and reported with a ``RuntimeWarning``.
+    the original eager code, counted in ``handle.describe()["fallbacks"]``. Without
+    FlashAttention 2, or without the decode part that the prefill and expert build
+    on, the requested parts all stay eager: ``handle.skipped`` lists why, and a
+    ``RuntimeWarning`` reports it.
     """
     config = config or AccelConfig()
     if getattr(model, "_alpamayo2_edge_accel", None) is not None:
         raise RuntimeError("Acceleration is already enabled on this model")
-    if getattr(model.vlm.model.visual, "_alpamayo2_edge_vit_cache", None) is not None:
-        raise RuntimeError("Enable acceleration before installing a VisionFeatureCache")
     if not model.config.enable_expert:
         raise ValueError("Acceleration requires the trajectory expert")
     device = model.device
@@ -197,12 +191,6 @@ def enable_acceleration(model: torch.nn.Module, config: AccelConfig | None = Non
         )
     if "expert" in parts:
         accelerators.append(ExpertAccelerator(model, **common, mode="default"))
-    if "vision" in parts:
-        accelerators.append(
-            VisionAccelerator(
-                model.vlm.model.visual, **common, mode="default", fa3=kernels["vision"] == "fa3"
-            )
-        )
     handle = AccelHandle(model, config, kernels, skipped, stats, accelerators)
     model._alpamayo2_edge_accel = handle
     _raise_recompile_limit()
@@ -213,9 +201,6 @@ __all__ = [
     "AccelConfig",
     "AccelHandle",
     "FlashKVCache",
-    "VisionFeatureCache",
     "enable_acceleration",
-    "image_frame_ids",
     "resolve_kernels",
-    "use_linear_patch_embedding",
 ]

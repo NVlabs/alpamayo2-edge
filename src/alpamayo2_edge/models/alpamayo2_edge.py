@@ -56,7 +56,7 @@ class MaskTokenIdsLogitsProcessor(LogitsProcessor):
 
 
 class Alpamayo2Edge(PreTrainedModel):
-    """Qwen3-VL reasoning followed by ten-step trajectory flow matching.
+    """Cosmos3-Edge reasoning followed by ten-step trajectory flow matching.
 
     The VLM and expert retain their checkpoint module names and KV geometry.
     Every trajectory samples its own CoT from a shared prompt prefill.
@@ -98,7 +98,7 @@ class Alpamayo2Edge(PreTrainedModel):
             self.expert = ExpertModel._from_config(config.expert_config)
             vlm_text = config.vlm_config.text_config
             expert_text = config.expert_config.llm_config
-            for field in ("num_hidden_layers", "num_key_value_heads", "head_dim"):
+            for field in ("model_type", "num_hidden_layers", "num_key_value_heads", "head_dim"):
                 if getattr(vlm_text, field) != getattr(expert_text, field):
                     raise ValueError(f"VLM and expert must share KV-cache geometry ({field}).")
         self.post_init()
@@ -244,7 +244,7 @@ class Alpamayo2Edge(PreTrainedModel):
             "image_grid_thw" in tokenized_data or "video_grid_thw" in tokenized_data
         ):
             # Older packed fixtures omit this HF5 processor field. Without it,
-            # Qwen3-VL generation silently uses text positions for vision tokens.
+            # generation silently uses text positions for vision tokens.
             token_types = torch.zeros_like(input_ids)
             token_types[input_ids == self.config.vlm_config.image_token_id] = 1
             token_types[input_ids == self.config.vlm_config.video_token_id] = 2

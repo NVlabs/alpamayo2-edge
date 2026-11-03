@@ -222,14 +222,14 @@ def main(argv=None) -> None:
         "--accel",
         choices=["off", "compile", "tuned"],
         default="off",
-        help="torch.compile + CUDA graphs for vision, prefill, decode and the expert "
+        help="torch.compile + CUDA graphs for prefill, decode and the expert "
         "(CUDA, BF16, needs flash-attn); tuned also autotunes the decode step",
     )
     parser.add_argument(
         "--accel-attention",
         choices=["auto", "fa3", "sdpa"],
         default="auto",
-        help="Vision/prefill attention in the graphs; auto uses FlashAttention 3 on Hopper "
+        help="Prefill attention in the graphs; auto uses FlashAttention 3 on Hopper "
         "when installed, otherwise SDPA",
     )
     parser.add_argument(
@@ -237,19 +237,6 @@ def main(argv=None) -> None:
         type=int,
         default=1,
         help="Untimed runs of the first input that compile and capture graphs (with --accel)",
-    )
-    parser.add_argument(
-        "--accel-allow-partial",
-        action="store_true",
-        help="With --accel, continue when flash-attn is missing: only the vision tower is "
-        "accelerated (otherwise this is an error)",
-    )
-    parser.add_argument(
-        "--patch-embed",
-        choices=["conv", "linear"],
-        default="conv",
-        help="Vision patch embedding: the checkpoint's Conv3d or the equivalent GEMM, which "
-        "avoids slow BF16 Conv3d kernels (e.g. PyTorch 2.9 on GB10)",
     )
     args = parser.parse_args(argv)
     if args.sample_index is not None and not args.manifest:
@@ -275,8 +262,6 @@ def main(argv=None) -> None:
         parser.error("--accel requires a CUDA --device and --dtype bfloat16")
     if args.accel_warmup < 0:
         parser.error("--accel-warmup must be nonnegative")
-    if args.accel_allow_partial and args.accel == "off":
-        parser.error("--accel-allow-partial requires --accel")
     if args.accel != "off":
         from alpamayo2_edge.accel import resolve_kernels
 
@@ -284,11 +269,10 @@ def main(argv=None) -> None:
             kernels = resolve_kernels(args.accel_attention, args.device)
         except ValueError as exc:
             parser.error(str(exc))
-        if kernels["decode"] is None and not args.accel_allow_partial:
+        if kernels["decode"] is None:
             parser.error(
                 "--accel needs an importable flash_attn (FlashAttention 2) for the prefill, "
-                "decode and expert graphs; without it only the vision tower is accelerated. "
-                "Install it (see docs/acceleration.md#requirements) or pass --accel-allow-partial."
+                "decode and expert graphs; install it (see docs/acceleration.md#requirements)."
             )
     settings = dict(
         seed=43,
@@ -330,10 +314,6 @@ def main(argv=None) -> None:
         local_files_only=args.local_files_only,
     )
     acceleration = None
-    if args.patch_embed == "linear":
-        from alpamayo2_edge.accel import use_linear_patch_embedding
-
-        use_linear_patch_embedding(model)
     if args.accel != "off":
         from alpamayo2_edge.accel import AccelConfig, enable_acceleration
 
@@ -355,8 +335,6 @@ def main(argv=None) -> None:
         "loading_info": loading_info,
         "samples": records,
     }
-    if args.patch_embed != "conv":
-        report["patch_embedding"] = args.patch_embed
     if acceleration is not None:
         report["acceleration"] = {
             **acceleration.describe(),

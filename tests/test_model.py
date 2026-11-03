@@ -258,14 +258,14 @@ def test_legacy_packed_inputs_get_multimodal_position_types(monkeypatch):
 
 
 def _tiny_model(monkeypatch):
-    """Build actual Qwen3-VL vision/text layers and an expert without external assets."""
-    from transformers import Qwen3VLConfig
+    """Build actual Cosmos3-Edge vision/text layers and an expert without external assets."""
+    from transformers import Cosmos3EdgeConfig
 
     import alpamayo2_edge.models.alpamayo2_edge as module
     from alpamayo2_edge.config import Alpamayo2EdgeConfig
 
     text_config = {
-        "model_type": "qwen3_vl_text",
+        "model_type": "cosmos3_edge_text",
         "vocab_size": 128,
         "hidden_size": 64,
         "intermediate_size": 96,
@@ -277,7 +277,6 @@ def _tiny_model(monkeypatch):
             "rope_type": "default",
             "rope_theta": 10000.0,
             "mrope_section": [2, 3, 3],
-            "mrope_interleaved": True,
         },
         "eos_token_id": 2,
         "bos_token_id": 1,
@@ -285,22 +284,21 @@ def _tiny_model(monkeypatch):
     config = Alpamayo2EdgeConfig(
         dtype="float32",
         vlm_name_or_path="test-tokenizer",
-        vlm_config=Qwen3VLConfig(
+        vlm_config=Cosmos3EdgeConfig(
             text_config=text_config,
             image_token_id=10,
             video_token_id=13,
             vision_start_token_id=11,
             vision_end_token_id=12,
+            projector_hidden_size=48,
             vision_config={
-                "depth": 1,
+                "num_hidden_layers": 1,
                 "hidden_size": 32,
                 "intermediate_size": 48,
-                "num_heads": 2,
-                "out_hidden_size": 64,
+                "num_attention_heads": 2,
                 "patch_size": 2,
-                "temporal_patch_size": 2,
+                "num_patches": 4,
                 "spatial_merge_size": 2,
-                "deepstack_visual_indexes": [],
             },
         ),
         expert_config={
@@ -329,7 +327,7 @@ def _tiny_model(monkeypatch):
 
 
 @pytest.mark.parametrize("generation_limit", [1, 8])
-def test_real_qwen_generation_and_expert_integration_on_cpu(monkeypatch, generation_limit):
+def test_real_generation_and_expert_integration_on_cpu(monkeypatch, generation_limit):
     """Exercise HF generate/cache/position APIs using small real model layers."""
     model = _tiny_model(monkeypatch)
 
@@ -369,9 +367,7 @@ def test_shared_prefill_preserves_real_cache_positions_and_padding(monkeypatch, 
             [[0, 0, 1, 11, 10, 10, 10, 10, 12, 6], [1, 3, 4, 11, 10, 10, 10, 10, 12, 6]]
         )
     else:
-        input_ids = torch.tensor(
-            [[0, 0, 1, 3, 4, 5, 6, 7, 8, 6], [1, 3, 4, 5, 6, 7, 8, 9, 3, 6]]
-        )
+        input_ids = torch.tensor([[0, 0, 1, 3, 4, 5, 6, 7, 8, 6], [1, 3, 4, 5, 6, 7, 8, 9, 3, 6]])
     tokenized = {
         "input_ids": input_ids,
         "attention_mask": input_ids.ne(0).long(),
@@ -380,7 +376,7 @@ def test_shared_prefill_preserves_real_cache_positions_and_padding(monkeypatch, 
         tokenized.update(
             mm_token_type_ids=input_ids.eq(10).long(),
             image_grid_thw=torch.tensor([[1, 4, 4], [1, 4, 4]]),
-            pixel_values=torch.randn(32, 24),
+            pixel_values=torch.randn(32, 12),
         )
     generation_config = GenerationConfig(
         do_sample=False,
@@ -429,3 +425,13 @@ def test_shared_prefill_preserves_real_cache_positions_and_padding(monkeypatch, 
             torch.testing.assert_close(
                 actual_states[mask], reference_states[mask], rtol=1e-4, atol=1e-5
             )
+
+
+def test_cot_omits_the_closed_think_block():
+    from alpamayo2_edge.models.token_utils import extract_text_tokens
+
+    text = "<|im_start|>assistant\n<think></think>Keep lane behind the truck.<|traj_future_start|>"
+    tokenizer = SimpleNamespace(batch_decode=lambda tokens, skip_special_tokens: [text])
+    decoded = extract_text_tokens(tokenizer, torch.zeros(1, 1, dtype=torch.long))
+    assert decoded["cot"] == ["Keep lane behind the truck."]
+    assert decoded["raw_outputs"] == [text]

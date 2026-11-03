@@ -13,7 +13,7 @@ from torchvision.transforms.functional import InterpolationMode, resize
 from transformers import AutoProcessor
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
-from alpamayo2_edge.chat_template import build_conversation
+from alpamayo2_edge.chat_template import CLOSED_THINKING, build_conversation
 from alpamayo2_edge.config import resolve_checkpoint_name_or_path
 from alpamayo2_edge.sample import canonicalize_sample
 
@@ -55,9 +55,13 @@ def get_processor(tokenizer: Any, model_config: Any) -> Any:
 
 
 def _normalize_patches(patches: torch.Tensor, image_processor: Any) -> torch.Tensor:
-    """Apply the checkpoint's fused uint8 rescale and normalization operation."""
+    """Apply the checkpoint's fused uint8 rescale and normalization operation.
+
+    Each flattened patch is laid out (height, width, channel, time).
+    """
     channels = len(image_processor.image_mean)
-    patch_dim = channels * image_processor.temporal_patch_size * image_processor.patch_size**2
+    temporal = image_processor.temporal_patch_size
+    patch_dim = channels * temporal * image_processor.patch_size**2
     if patches.dtype != torch.uint8 or patches.ndim != 2 or patches.shape[1] != patch_dim:
         raise ValueError(f"Processor must return uint8 image patches [N, {patch_dim}]")
     scale = 1.0 / image_processor.rescale_factor
@@ -67,8 +71,8 @@ def _normalize_patches(patches: torch.Tensor, image_processor: Any) -> torch.Ten
     std = (
         torch.tensor(image_processor.image_std, dtype=torch.float32, device=patches.device) * scale
     )
-    result = patches.float().reshape(-1, channels, patch_dim // channels)
-    result.sub_(mean.reshape(1, channels, 1)).div_(std.reshape(1, channels, 1))
+    result = patches.float().reshape(-1, image_processor.patch_size**2, channels, temporal)
+    result.sub_(mean.reshape(1, 1, channels, 1)).div_(std.reshape(1, 1, channels, 1))
     return result.reshape(-1, patch_dim)
 
 
@@ -87,13 +91,17 @@ def prepare_model_inputs(data: dict[str, Any], model_config: Any, tokenizer: Any
         include_camera_ids=model_config.include_camera_ids,
         system_prompt=getattr(model_config, "system_prompt", None),
     )
+    # Driving targets start with an empty think block, so the prompt closes it.
     text = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
         add_vision_id=False,
         continue_final_message=False,
+        enable_thinking=False,
     )
+    if not text.endswith(CLOSED_THINKING):
+        raise ValueError(f"The chat template must end the driving prompt with {CLOSED_THINKING}")
     image_processor = processor.image_processor
     images = []
     for message in messages:
@@ -114,6 +122,7 @@ def prepare_model_inputs(data: dict[str, Any], model_config: Any, tokenizer: Any
             images=images,
             padding=False,
             return_tensors="pt",
+            return_mm_token_type_ids=True,
             do_resize=False,
             do_rescale=False,
             do_normalize=False,

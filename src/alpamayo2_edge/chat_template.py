@@ -20,6 +20,8 @@ DRIVING_TASK = (
     "Your task: output the chain-of-thought reasoning of the driving process, "
     "then output the future trajectory."
 )
+# Driving answers follow an empty think block, which the prompt supplies.
+CLOSED_THINKING = "<think></think>"
 
 
 def relative_time_labels(timestamps: torch.Tensor) -> list[str]:

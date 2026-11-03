@@ -4,7 +4,7 @@
 """Attention kernels used inside the accelerated graphs, and their selection.
 
 Decode and expert steps attend a static flash-layout KV cache through
-``flash_attn_with_kvcache`` from FlashAttention 2. Vision and prefill use PyTorch
+``flash_attn_with_kvcache`` from FlashAttention 2. The prompt prefill uses PyTorch
 SDPA or, on Hopper with FlashAttention 3 installed, FA3. Both kernels are custom
 ops, so ``torch.compile`` keeps each as one opaque kernel. CPU tensors use a
 PyTorch reference implementation, which keeps the control flow testable without
@@ -17,7 +17,7 @@ import importlib
 import torch
 import torch.nn.functional as F
 
-PARTS = ("vision", "prefill", "decode", "expert")
+PARTS = ("prefill", "decode", "expert")
 ATTENTION_CHOICES = ("auto", "fa3", "sdpa")
 
 
@@ -128,7 +128,7 @@ def _importable(module_name: str) -> bool:
 def resolve_kernels(attention: str, device: torch.device | str) -> dict[str, str | None]:
     """Choose the attention kernel of each accelerated part.
 
-    ``vision`` and ``prefill`` use ``"fa3"`` or ``"sdpa"``. ``"auto"`` picks FA3 only on
+    ``prefill`` uses ``"fa3"`` or ``"sdpa"``. ``"auto"`` picks FA3 only on
     Hopper (compute capability 9.0) with ``flash_attn_interface`` importable.
     ``decode`` and ``expert`` use ``"fa2"`` when ``flash_attn`` is importable, otherwise
     ``None`` (those parts stay eager). FA2 is kept for one-token decode on Hopper too,
@@ -140,8 +140,7 @@ def resolve_kernels(attention: str, device: torch.device | str) -> dict[str, str
     if device.type != "cuda":
         if attention == "fa3":
             raise ValueError("FlashAttention 3 requires a CUDA device")
-        dense = "sdpa"
-        return {"vision": dense, "prefill": dense, "decode": "reference", "expert": "reference"}
+        return {"prefill": "sdpa", "decode": "reference", "expert": "reference"}
     hopper = torch.cuda.get_device_capability(device) == (9, 0)
     fa3 = hopper and _importable("flash_attn_interface")
     if attention == "fa3" and not fa3:
@@ -150,4 +149,4 @@ def resolve_kernels(attention: str, device: torch.device | str) -> dict[str, str
         )
     dense = "fa3" if attention == "fa3" or (attention == "auto" and fa3) else "sdpa"
     kvcache = "fa2" if _importable("flash_attn") else None
-    return {"vision": dense, "prefill": dense, "decode": kvcache, "expert": kvcache}
+    return {"prefill": dense, "decode": kvcache, "expert": kvcache}

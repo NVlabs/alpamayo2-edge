@@ -19,6 +19,7 @@ import re
 import torch
 from transformers import AutoTokenizer, StoppingCriteria
 
+from alpamayo2_edge.chat_template import CLOSED_THINKING
 from alpamayo2_edge.models.utils import SPECIAL_TOKENS
 
 logger = logging.getLogger(__name__)
@@ -150,7 +151,8 @@ def extract_text_tokens(
     def assistant_text(text: str) -> str:
         if assistant_marker in text:
             text = text[text.rfind(assistant_marker) + len(assistant_marker) :]
-        return text.split(traj_future_start, 1)[0].split(im_end, 1)[0].strip()
+        text = text.split(traj_future_start, 1)[0].split(im_end, 1)[0].strip()
+        return text.removeprefix(CLOSED_THINKING).strip()
 
     assistant_texts = [assistant_text(text) for text in decoded_batch]
     extracted_text = {

@@ -17,7 +17,7 @@ HISTORY_STEPS = 20
 FUTURE_STEPS = 64
 DT = 0.1
 
-# Released Edge action-space configs: the course space (GA) and the yaw space it replaces (EA).
+# Edge action-space configs: the course space and the yaw space.
 _COMMON = {
     "accel_mean": 0.02902694707164455,
     "accel_std": 0.6810426736454882,

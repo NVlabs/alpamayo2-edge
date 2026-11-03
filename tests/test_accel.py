@@ -6,14 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from alpamayo2_edge.accel import (
-    AccelConfig,
-    FlashKVCache,
-    VisionFeatureCache,
-    enable_acceleration,
-    image_frame_ids,
-    resolve_kernels,
-)
+from alpamayo2_edge.accel import AccelConfig, FlashKVCache, enable_acceleration, resolve_kernels
 from alpamayo2_edge.accel import kernels as kernels_module
 from alpamayo2_edge.accel.decode import MaskColumns
 from alpamayo2_edge.accel.expert import _mask_hides_tokens
@@ -21,18 +14,18 @@ from alpamayo2_edge.accel.expert import _mask_hides_tokens
 ANCHOR = 9
 # Two patch grids, as the side and front cameras have: 16 and 24 patches per image.
 GRIDS = [(1, 4, 4), (1, 4, 4), (1, 4, 6), (1, 4, 4), (1, 4, 6)]
-PATCH_DIM = 3 * 2 * 2 * 2
+PATCH_DIM = 3 * 2 * 2
 
 
 def _tiny_model(monkeypatch, dtype="float32"):
-    """Real Qwen3-VL vision/text layers (with DeepStack) and an expert, without assets."""
-    from transformers import Qwen3VLConfig
+    """Real Cosmos3-Edge vision/text layers and an expert, without assets."""
+    from transformers import Cosmos3EdgeConfig
 
     import alpamayo2_edge.models.alpamayo2_edge as module
     from alpamayo2_edge.config import Alpamayo2EdgeConfig
 
     text_config = {
-        "model_type": "qwen3_vl_text",
+        "model_type": "cosmos3_edge_text",
         "vocab_size": 128,
         "hidden_size": 64,
         "intermediate_size": 96,
@@ -44,7 +37,6 @@ def _tiny_model(monkeypatch, dtype="float32"):
             "rope_type": "default",
             "rope_theta": 10000.0,
             "mrope_section": [2, 3, 3],
-            "mrope_interleaved": True,
         },
         "eos_token_id": 2,
         "bos_token_id": 1,
@@ -52,22 +44,21 @@ def _tiny_model(monkeypatch, dtype="float32"):
     config = Alpamayo2EdgeConfig(
         dtype=dtype,
         vlm_name_or_path="test-tokenizer",
-        vlm_config=Qwen3VLConfig(
+        vlm_config=Cosmos3EdgeConfig(
             text_config=text_config,
             image_token_id=10,
             video_token_id=13,
             vision_start_token_id=11,
             vision_end_token_id=12,
+            projector_hidden_size=48,
             vision_config={
-                "depth": 2,
                 "hidden_size": 32,
                 "intermediate_size": 48,
-                "num_heads": 2,
-                "out_hidden_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
                 "patch_size": 2,
-                "temporal_patch_size": 2,
+                "num_patches": 16,
                 "spatial_merge_size": 2,
-                "deepstack_visual_indexes": [0],
             },
         ),
         expert_config={
@@ -151,6 +142,29 @@ def _sample(model, inputs, num_traj_sets=1, max_generation_length=8, seed=3, top
         )
 
 
+def _sample_with_prefix_cache(model, inputs, **kwargs):
+    """``_sample`` plus the prompt and CoT keys/values the expert attends, per layer."""
+    installed = vars(model).get("_sample_actions")
+    sample_actions = model._sample_actions
+    columns = []
+
+    def capture(cache, prefix_length, *args):
+        columns.extend(
+            torch.stack([layer.keys[:, :, :prefix_length], layer.values[:, :, :prefix_length]])
+            for layer in cache.layers
+        )
+        return sample_actions(cache, prefix_length, *args)
+
+    model._sample_actions = capture
+    try:
+        return _sample(model, inputs, **kwargs), torch.stack(columns)
+    finally:
+        if installed is None:
+            del model._sample_actions
+        else:
+            model._sample_actions = installed
+
+
 def _cpu_config(**kwargs):
     return AccelConfig(compile=False, cuda_graphs=False, **kwargs)
 
@@ -161,24 +175,14 @@ def test_kernel_selection_per_gpu(monkeypatch):
         monkeypatch.setattr(kernels_module, "_importable", lambda name: name in importable)
 
     fake((9, 0), {"flash_attn", "flash_attn_interface"})
-    assert resolve_kernels("auto", "cuda") == {
-        "vision": "fa3",
-        "prefill": "fa3",
-        "decode": "fa2",
-        "expert": "fa2",
-    }
-    assert resolve_kernels("sdpa", "cuda")["vision"] == "sdpa"
+    assert resolve_kernels("auto", "cuda") == {"prefill": "fa3", "decode": "fa2", "expert": "fa2"}
+    assert resolve_kernels("sdpa", "cuda")["prefill"] == "sdpa"
     fake((9, 0), {"flash_attn"})
     assert resolve_kernels("auto", "cuda")["prefill"] == "sdpa"
     with pytest.raises(ValueError, match="Hopper"):
         resolve_kernels("fa3", "cuda")
     fake((12, 1), {"flash_attn", "flash_attn_interface"})
-    assert resolve_kernels("auto", "cuda") == {
-        "vision": "sdpa",
-        "prefill": "sdpa",
-        "decode": "fa2",
-        "expert": "fa2",
-    }
+    assert resolve_kernels("auto", "cuda") == {"prefill": "sdpa", "decode": "fa2", "expert": "fa2"}
     fake((8, 0), set())
     assert resolve_kernels("auto", "cuda")["decode"] is None
     assert resolve_kernels("auto", "cpu")["decode"] == "reference"
@@ -190,21 +194,16 @@ def test_parts_without_flash_attention_are_skipped(monkeypatch):
     model = _tiny_model(monkeypatch)
     monkeypatch.setattr(
         "alpamayo2_edge.accel.resolve_kernels",
-        lambda attention, device: {
-            "vision": "sdpa",
-            "prefill": "sdpa",
-            "decode": None,
-            "expert": None,
-        },
+        lambda attention, device: {"prefill": "sdpa", "decode": None, "expert": None},
     )
     with pytest.warns(RuntimeWarning, match="flash_attn") as record:
         handle = enable_acceleration(model, _cpu_config())
-    assert "accelerated parts: vision" in str(record[0].message)
+    assert "accelerated parts: none" in str(record[0].message)
     report = handle.describe()
-    assert report["parts"] == ["vision"]
+    assert report["parts"] == []
     assert set(report["skipped"]) == {"prefill", "decode", "expert"}
     handle.remove()
-    assert "forward" not in vars(model.vlm.model.visual)
+    assert "_generate_with_shared_prefill" not in vars(model)
 
 
 def test_config_validation_and_recompile_limit(monkeypatch):
@@ -223,29 +222,6 @@ def test_config_validation_and_recompile_limit(monkeypatch):
     assert dynamo_config.recompile_limit == 64  # The other model still needs it.
     handles[1].remove()
     assert dynamo_config.recompile_limit == 8
-
-
-def test_install_order_of_vision_options(monkeypatch):
-    from alpamayo2_edge.accel import use_linear_patch_embedding
-
-    model = _tiny_model(monkeypatch)
-    embed = model.vlm.model.visual.patch_embed
-    cache = VisionFeatureCache(model)
-    with pytest.raises(RuntimeError, match="before installing a VisionFeatureCache"):
-        enable_acceleration(model, _cpu_config())
-    with pytest.raises(RuntimeError, match="already installed"):
-        VisionFeatureCache(model)
-    with pytest.raises(RuntimeError, match="Switch the patch embedding"):
-        use_linear_patch_embedding(model)
-    cache.remove()
-    restore = use_linear_patch_embedding(model)
-    assert "forward" in vars(embed)
-    handle = enable_acceleration(model, _cpu_config())
-    with pytest.raises(RuntimeError, match="Switch the patch embedding"):
-        restore()  # Graphs captured with the GEMM would keep it.
-    handle.remove()
-    restore()
-    assert "forward" not in vars(embed)
 
 
 def test_mask_columns_matches_mask_token_ids_processor():
@@ -361,30 +337,47 @@ def test_kvcache_attention_reference_appends_and_attends(causal):
         torch.testing.assert_close(out[row], expected, rtol=1e-5, atol=1e-5)
 
 
-def test_vision_groups_match_hf_forward(monkeypatch):
-    model = _tiny_model(monkeypatch)
-    visual = model.vlm.model.visual
-    inputs = _image_inputs()["tokenized_data"]
+@pytest.mark.parametrize("block", ["prefill_sdpa", "prefill_fa3", "decode"])
+def test_fused_blocks_match_the_decoder_layer(monkeypatch, block):
+    from transformers.cache_utils import DynamicCache
+
+    from alpamayo2_edge.accel.decode import decoder_block, prefill_block
+
+    text = _tiny_model(monkeypatch).vlm.model.language_model
+    layer, config = text.layers[0], text.config
+    rows, seq = 2, 6
+    hidden = torch.randn(rows, seq, config.hidden_size, generator=torch.Generator().manual_seed(2))
+    # Distinct temporal, height and width planes, as for vision tokens.
+    positions = torch.arange(seq).view(1, 1, seq) + torch.tensor([0, 2, 5]).view(3, 1, 1)
+    cos, sin = text.rotary_emb(hidden, positions.expand(3, rows, seq))
+    shape = (rows, 8, config.num_key_value_heads, config.head_dim)
     with torch.inference_mode():
-        expected = visual(inputs["pixel_values"], grid_thw=inputs["image_grid_thw"])
-        handle = enable_acceleration(model, _cpu_config(parts=("vision",)))
-        actual = visual(inputs["pixel_values"], grid_thw=inputs["image_grid_thw"], return_dict=True)
-    torch.testing.assert_close(actual.pooler_output, expected.pooler_output)
-    assert len(actual.deepstack_features) == len(expected.deepstack_features) == 1
-    torch.testing.assert_close(actual.deepstack_features[0], expected.deepstack_features[0])
-    assert handle.describe()["graph_builds"] == 2
-    handle.remove()
+        cache = DynamicCache(config=config)
+        expected = layer(
+            hidden, position_embeddings=(cos, sin), past_key_values=cache, use_cache=True
+        )
+        k_cache, v_cache = torch.zeros(shape), torch.zeros(shape)
+        if block == "decode":
+            seqlens = torch.zeros(rows, dtype=torch.int32)
+            actual = decoder_block(layer, hidden, cos, sin, k_cache, v_cache, seqlens, True)
+        else:
+            fa3 = block == "prefill_fa3"
+            actual = prefill_block(layer, hidden, cos, sin, k_cache, v_cache, False, fa3)
+    # Residual updates: the residual stream itself would hide small errors.
+    torch.testing.assert_close(actual - hidden, expected - hidden)
+    torch.testing.assert_close(k_cache[:, :seq].transpose(1, 2), cache.layers[0].keys)
+    torch.testing.assert_close(v_cache[:, :seq].transpose(1, 2), cache.layers[0].values)
 
 
 @pytest.mark.parametrize("num_traj_sets", [1, 2])
 def test_accelerated_sampling_matches_eager_on_cpu(monkeypatch, num_traj_sets):
     model = _tiny_model(monkeypatch)
     inputs = _image_inputs()
-    expected = _sample(model, inputs, num_traj_sets=num_traj_sets)
+    expected, expected_cache = _sample_with_prefix_cache(model, inputs, num_traj_sets=num_traj_sets)
     handle = enable_acceleration(model, _cpu_config())
-    actual = _sample(model, inputs, num_traj_sets=num_traj_sets)
+    actual, actual_cache = _sample_with_prefix_cache(model, inputs, num_traj_sets=num_traj_sets)
     report = handle.describe()
-    assert report["parts"] == ["vision", "prefill", "decode", "expert"]
+    assert report["parts"] == ["prefill", "decode", "expert"]
     if num_traj_sets == 1:
         assert report["fallbacks"] == {}
     else:
@@ -393,6 +386,8 @@ def test_accelerated_sampling_matches_eager_on_cpu(monkeypatch, num_traj_sets):
     generated = expected[3]["generated_ids"]
     assert generated.tolist() == [[6, 7, 8, ANCHOR, -1]] * num_traj_sets
     torch.testing.assert_close(actual[3]["generated_ids"], generated)
+    # Decode positions barely move the trajectories, but they set the CoT keys.
+    torch.testing.assert_close(actual_cache, expected_cache, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(actual[0], expected[0], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-5)
     handle.remove()
@@ -400,7 +395,6 @@ def test_accelerated_sampling_matches_eager_on_cpu(monkeypatch, num_traj_sets):
         (model, "_generate_with_shared_prefill"),
         (model, "_sample_actions"),
         (model.vlm, "forward"),
-        (model.vlm.model.visual, "forward"),
     ):
         assert name not in vars(owner)
 
@@ -414,18 +408,19 @@ def test_warmup_builds_graphs_without_consuming_random_state(monkeypatch):
     )
     assert torch.equal(torch.get_rng_state(), state)
     builds = [build["part"] for build in handle.describe()["builds"]]
-    assert sorted(builds) == ["decode_sample", "expert", "prefill", "vision", "vision"]
+    assert sorted(builds) == ["decode_sample", "expert", "prefill"]
 
 
 def test_generation_limit_on_anchor_completes_the_flash_cache(monkeypatch):
     model = _tiny_model(monkeypatch)
     inputs = _image_inputs()
     # The limit lands on the anchor: the model forwards it after generation.
-    expected = _sample(model, inputs, max_generation_length=4)
+    expected, expected_cache = _sample_with_prefix_cache(model, inputs, max_generation_length=4)
     handle = enable_acceleration(model, _cpu_config())
-    actual = _sample(model, inputs, max_generation_length=4)
+    actual, actual_cache = _sample_with_prefix_cache(model, inputs, max_generation_length=4)
     assert expected[3]["generated_ids"].tolist() == [[6, 7, 8, ANCHOR]]
     torch.testing.assert_close(actual[3]["generated_ids"], expected[3]["generated_ids"])
+    torch.testing.assert_close(actual_cache, expected_cache, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(actual[0], expected[0], rtol=1e-5, atol=1e-5)
     assert handle.describe()["fallbacks"] == {}
 
@@ -464,12 +459,7 @@ def test_compiled_cuda_graphs_match_eager_on_gpu(monkeypatch):
     report = handle.describe()
     assert report["fallbacks"] == {}
     assert report["graph_builds"] == builds  # Same shapes: replays only.
-    assert {build["part"] for build in report["builds"]} == {
-        "vision",
-        "prefill",
-        "decode_sample",
-        "expert",
-    }
+    assert {build["part"] for build in report["builds"]} == {"prefill", "decode_sample", "expert"}
     torch.testing.assert_close(actual[3]["generated_ids"], expected[3]["generated_ids"])
     torch.testing.assert_close(again[0], actual[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[0], expected[0], rtol=0.05, atol=0.05)
@@ -569,178 +559,3 @@ def _to_cuda(inputs):
     from alpamayo2_edge.helper import to_device
 
     return to_device(inputs, device="cuda")
-
-
-def _frame_stream(n_steps):
-    """Per-step frame IDs and patches, where each step drops the oldest frame per camera."""
-    generator = torch.Generator().manual_seed(7)
-    cameras = {0: (1, 4, 4), 1: (1, 4, 6)}
-    frames = {}
-
-    def frame(camera, step):
-        key = (camera, step * 100_000)
-        if key not in frames:
-            t, h, w = cameras[camera]
-            frames[key] = torch.randn(t * h * w, PATCH_DIM, generator=generator)
-        return key
-
-    steps = []
-    for step in range(n_steps):
-        ids = [frame(camera, step - offset) for camera in cameras for offset in (2, 1, 0)]
-        steps.append(ids)
-    return steps, frames, cameras
-
-
-def _packed(ids, frames, cameras):
-    grids = [cameras[camera] for camera, _ in ids]
-    return {
-        "tokenized_data": {
-            "input_ids": torch.ones(1, 4, dtype=torch.long),
-            "pixel_values": torch.cat([frames[key] for key in ids]),
-            "image_grid_thw": torch.tensor(grids),
-        }
-    }
-
-
-def test_vit_cache_reuses_past_frame_features(monkeypatch):
-    model = _tiny_model(monkeypatch)
-    vlm_model = model.vlm.model
-    steps, frames, cameras = _frame_stream(4)
-    with torch.inference_mode():
-        expected = [
-            vlm_model.get_image_features(**_inputs(_packed(ids, frames, cameras))) for ids in steps
-        ]
-        cache = VisionFeatureCache(model)
-        for step, ids in enumerate(steps):
-            prepared = cache.prepare(_packed(ids, frames, cameras), ids)
-            encoded = prepared["tokenized_data"]["pixel_values"].shape[0]
-            assert encoded == (sum(16 + 24 for _ in range(3)) if step == 0 else 16 + 24)
-            actual = vlm_model.get_image_features(**_inputs(prepared))
-            # Images are encoded independently. Only CPU GEMM blocking, which depends
-            # on how many rows are encoded together, perturbs the last FP32 bit.
-            for got, want in zip(actual.pooler_output, expected[step].pooler_output, strict=True):
-                torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
-            torch.testing.assert_close(
-                actual.deepstack_features[0],
-                expected[step].deepstack_features[0],
-                rtol=1e-6,
-                atol=1e-6,
-            )
-    assert cache.describe()["images_reused"] == 3 * 4
-    assert cache.describe()["images_encoded"] == 6 + 3 * 2
-
-
-def _inputs(batch):
-    data = batch["tokenized_data"]
-    return {"pixel_values": data["pixel_values"], "image_grid_thw": data["image_grid_thw"]}
-
-
-def test_vit_cache_keys_and_contract(monkeypatch):
-    model = _tiny_model(monkeypatch)
-    steps, frames, cameras = _frame_stream(1)
-    cache = VisionFeatureCache(model, max_images=4)
-    encode = model.vlm.model.get_image_features
-    batch = _packed(steps[0], frames, cameras)
-    altered = copy.deepcopy(batch)
-    altered["tokenized_data"]["pixel_values"] += 1
-    with torch.inference_mode():
-        encode(**_inputs(cache.prepare(batch, steps[0])))
-        # The pixel fingerprint catches reused frame IDs with different pixels.
-        prepared = cache.prepare(altered, steps[0])
-        assert prepared["tokenized_data"]["pixel_values"].shape == (120, PATCH_DIM)
-        encode(**_inputs(prepared))
-        assert len(cache.store) == 4
-        # The least recently used frames were evicted: two of six are encoded again.
-        prepared = cache.prepare(altered, steps[0])
-        assert prepared["tokenized_data"]["pixel_values"].shape[0] == 16 + 16
-        with pytest.raises(RuntimeError, match="prepare"):
-            encode(**_inputs(altered))
-        encode(**_inputs(altered))  # Without a plan, the call runs uncached.
-    assert cache.describe()["uncached_calls"] == 1
-    with pytest.raises(ValueError, match="frame IDs"):
-        cache.prepare(batch, steps[0][:-1])
-    cache.remove()
-    assert "forward" not in vars(model.vlm.model.visual)
-
-
-def test_vit_cache_fingerprint_samples_every_patch():
-    from alpamayo2_edge.accel.vit_cache import _fingerprint
-
-    # The tiny model's patches and the checkpoint's 1,536-value patches.
-    for width in (PATCH_DIM, 1536):
-        rows = torch.randn(24, width, generator=torch.Generator().manual_seed(width))
-        reference = _fingerprint(rows, full_digest=False)
-        for row in range(rows.shape[0]):
-            changed = rows.clone()
-            changed[row] += 1
-            assert _fingerprint(changed, full_digest=False) != reference
-        assert _fingerprint(rows.clone(), full_digest=False) == reference
-
-
-def test_image_frame_ids_follow_the_packed_image_order():
-    from alpamayo2_edge.sample import canonicalize_sample
-
-    counts = {0: 3, 1: 5, 2: 3, 3: 3, 5: 3, 6: 5}
-    cameras = torch.tensor([camera for camera, count in counts.items() for _ in range(count)])
-    order = torch.randperm(22, generator=torch.Generator().manual_seed(3))
-    times = (1_000_000 + torch.arange(22) * 33_333)[order]
-    sample = {
-        "image_frames": torch.zeros(22, 1, 3, 2, 2, dtype=torch.uint8),
-        "camera_indices": cameras[order],
-        "absolute_timestamps": times,
-        "ego_history_xyz": torch.zeros(1, 20, 3),
-        "ego_history_rot": torch.eye(3).expand(1, 20, 3, 3).clone(),
-        "nav_text": ["Continue straight"],
-    }
-    canonical = canonicalize_sample(sample)
-    expected = list(
-        zip(canonical["camera_indices"].tolist(), canonical["absolute_timestamps"].tolist())
-    )
-    assert image_frame_ids(sample) == [(None, *pair) for pair in expected]
-    # Clip-relative timestamps repeat across clips; the clip ID keeps frame IDs apart.
-    assert image_frame_ids({**sample, "clip_id": "clip-a"})[0] == ("clip-a", *expected[0])
-    assert image_frame_ids(sample, stream="drive-7")[0] == ("drive-7", *expected[0])
-
-
-def test_vit_cache_matches_uncached_trajectories(monkeypatch):
-    model = _tiny_model(monkeypatch)
-    inputs = _image_inputs()
-    ids = [(index % 2, index) for index in range(len(GRIDS))]
-    expected = _sample(model, inputs)
-    cache = VisionFeatureCache(model)
-    with torch.inference_mode():
-        # Encode every frame once, as earlier time steps of a stream would have.
-        model.vlm.model.get_image_features(**_inputs(cache.prepare(inputs, ids)))
-    prepared = cache.prepare(inputs, ids)
-    assert prepared["tokenized_data"]["pixel_values"].shape[0] == 0
-    actual = _sample(model, prepared)
-    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
-    assert torch.equal(actual[3]["generated_ids"], expected[3]["generated_ids"])
-
-
-def test_vit_cache_on_accelerated_vision_matches_uncached(monkeypatch):
-    model = _tiny_model(monkeypatch)
-    handle = enable_acceleration(model, _cpu_config())
-    cache = VisionFeatureCache(model)  # Installed after acceleration: it wraps the graphs.
-    inputs = _image_inputs()
-    ids = [("clip", index % 2, index) for index in range(len(GRIDS))]
-    # The next time step: images 3 and 4 are new frames, images 0-2 were seen before.
-    later = copy.deepcopy(inputs)
-    new = torch.randn(40, PATCH_DIM, generator=torch.Generator().manual_seed(8))
-    later["tokenized_data"]["pixel_values"][56:] = new
-    later_ids = ids[:3] + [("clip", 1, 10), ("clip", 0, 11)]
-    expected, expected_later = _sample(model, inputs), _sample(model, later)  # Uncached.
-    for batch, frame_ids, want, encoded in (
-        (inputs, ids, expected, 96),  # Every frame is new.
-        (inputs, ids, expected, 0),  # Every frame is cached.
-        (later, later_ids, expected_later, 40),  # Two new frames.
-    ):
-        prepared = cache.prepare(batch, frame_ids)
-        assert prepared["tokenized_data"]["pixel_values"].shape[0] == encoded
-        actual = _sample(model, prepared)
-        assert torch.equal(actual[3]["generated_ids"], want[3]["generated_ids"])
-        torch.testing.assert_close(actual[0], want[0], rtol=1e-5, atol=1e-5)
-    assert cache.describe()["images_reused"] == 5 + 3
-    assert handle.describe()["fallbacks"] == {}
-    cache.remove()
-    handle.remove()

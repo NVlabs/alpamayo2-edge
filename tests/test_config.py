@@ -23,7 +23,7 @@ def test_normalizes_legacy_targets_without_changing_input_or_architecture():
             "action_in_proj_cfg": {
                 "_target_": "reasoning_vla.submodules.action_in_proj.PerWaypointActionInProjV2"
             },
-            "llm_config": {"model_type": "qwen3_vl_text", "hidden_size": 512},
+            "llm_config": {"model_type": "cosmos3_edge_text", "hidden_size": 512},
         },
     }
     before = copy.deepcopy(raw)

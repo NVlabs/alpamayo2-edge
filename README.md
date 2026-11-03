@@ -4,27 +4,22 @@
 # Alpamayo 2 Edge
 
 Standalone PyTorch inference for the 2B-parameter Alpamayo 2 Edge checkpoint and its
-trajectory diffusion expert. Given six-camera observations, ego history, and a
-navigation instruction, the model generates driving reasoning and 64 future poses
-at 0.1-second intervals.
+trajectory diffusion expert. The model is built on the Cosmos3-Edge vision-language
+backbone with a SigLIP2 vision encoder. Given six-camera observations, ego history,
+and a navigation instruction, it generates driving reasoning and 64 future poses at
+0.1-second intervals.
 
-Model access requires an authorized Hugging Face account. The commands below use
-the GA checkpoint; the early-access (EA) checkpoint also runs with this code.
-
-| Release | Weights | Code | Trajectory heading |
-| --- | --- | --- | --- |
-| GA | [nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge) | `ga-release` or later | Course: the rear axle's direction of travel |
-| EA | [nvidia/EA-Alpamayo2-Edge](https://huggingface.co/nvidia/EA-Alpamayo2-Edge) | `ea-release` or later | Body yaw |
-
-Each checkpoint's configuration selects its trajectory action space. With the GA
-checkpoint, decoded positions follow the course and decoded rotations estimate the
-body yaw, which differs from the path tangent by the rear-axle sideslip of the
-training vehicle. Code before `ga-release` rejects the GA configuration.
+Model access requires an authorized Hugging Face account. The weights are in
+[nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge); use the code at
+`ga-release` or later. Decoded positions follow the course, the rear axle's direction of
+travel, and decoded rotations estimate the body yaw, which differs from the path tangent
+by the rear-axle sideslip of the training vehicle.
 
 ## Setup
 
 Use Python 3.12 and a CUDA GPU for full model inference. Dependencies pin PyTorch
-2.8.0, torchvision 0.23.0, and Transformers 5.17.0. From this repository:
+2.8.0, torchvision 0.23.0, and Transformers 5.17.0, which provides the Cosmos3-Edge
+backbone. From this repository:
 
 ```bash
 uv sync --locked --dev
@@ -34,9 +29,8 @@ source .venv/bin/activate
 The default attention backend is PyTorch SDPA; installation does not build
 FlashAttention. FlashAttention 2.8.3 is an optional `flash` extra for environments
 with compatible CUDA build prerequisites. To select it after installation, pass
-`--attn-implementation flash_attention_2`. The original checkpoint's saved
-references were produced with FA2, BF16, and an H100; a different backend or
-runtime can change sampled text and trajectories.
+`--attn-implementation flash_attention_2`. A different backend or runtime can
+change sampled text and trajectories.
 
 ## Run a PhysicalAI-AV navigation example
 
@@ -52,7 +46,6 @@ hf auth login
 
 python -m alpamayo2_edge.inference \
     --model-id nvidia/Alpamayo2-Edge \
-    --revision eb341e482bddddc2f6a7bc963f0a0ce1091481b6 \
     --manifest examples/nav_samples.json \
     --output outputs/physicalai-nav
 ```
@@ -89,9 +82,9 @@ the clip, time, navigation text, and resolved dataset revision.
 ## Download the model for local use
 
 Authenticate using `hf auth login` or an existing `HF_TOKEN`, then download the
-immutable revision. The repository contains both model shards, tokenizer and
+model. The repository contains both model shards, tokenizer and
 processor assets, configuration, and a model card template. Allow approximately
-5.4 GB of disk space for the model. Examples stay in this GitHub repository and
+5.3 GB of disk space for the model. Examples stay in this GitHub repository and
 their image data is loaded separately from PhysicalAI-AV.
 
 ```bash
@@ -100,7 +93,6 @@ from huggingface_hub import snapshot_download
 
 snapshot_download(
     repo_id="nvidia/Alpamayo2-Edge",
-    revision="eb341e482bddddc2f6a7bc963f0a0ce1091481b6",
     local_dir=".work/Alpamayo2-Edge",
 )
 PY
@@ -110,7 +102,7 @@ export EDGE_MODEL="$PWD/.work/Alpamayo2-Edge"
 
 `$EDGE_MODEL` is the model directory itself. The loader resolves all tokenizer
 and processor assets from that directory, without fetching a separate backbone.
-Both released configurations use the standalone `alpamayo2_edge` model identifiers.
+The released configuration uses the standalone `alpamayo2_edge` model identifiers.
 
 ## Sampling settings
 
@@ -138,6 +130,9 @@ python -m alpamayo2_edge.inference \
 Use `--revision` to select an immutable HF snapshot. Other options include
 `--seed`, `--diffusion-steps`,
 `--max-generation-length`, `--device`, and `--dtype`; see `--help`.
+
+The driving prompt ends with an empty `<think></think>` block, as in training, so the
+model writes its driving reasoning directly; the decoded `cot` omits that block.
 
 Each sample's output directory contains `output.safetensors` with `pred_xyz`,
 `pred_rot`, and generated token IDs; `output.json` with decoded text and shape
@@ -224,10 +219,7 @@ used to rank candidates. The CLI checks trajectory shapes and finite values.
 
 Opt-in BF16 speedups in `alpamayo2_edge.accel` keep the model and its sampling
 semantics and change only how the GPU executes them. The defaults are unchanged,
-and nothing is quantized. On an H100, with `--accel tuned`, the model call (inputs
-already on the GPU, preprocessing excluded) took 127 ms instead of 952 ms for one
-CoT and its trajectory (7.5x), and 115 ms with the ViT cache in streaming use;
-six CoTs took 488 ms instead of 1,099 ms. Install FlashAttention 2 first
+and nothing is quantized. Install FlashAttention 2 first
 ([details](docs/acceleration.md#requirements)), then add `--accel tuned`:
 
 ```bash
@@ -238,57 +230,39 @@ python -m alpamayo2_edge.inference \
     --output outputs/accelerated
 ```
 
-- `--accel compile` or `--accel tuned` runs the vision tower, prompt prefill,
-  CoT decoding (including sampling) and the flow-matching loop with
-  `torch.compile` and CUDA graphs. `tuned` also autotunes the decode step. The
-  first input compiles and captures the graphs; later inputs with the same
-  shapes replay them. Without FlashAttention 2, `--accel` stops with an error;
-  `--accel-allow-partial` accelerates the vision tower only.
-- `--accel-attention` selects the attention kernel inside the vision and
-  prefill graphs. The default `auto` uses FlashAttention 3 on Hopper when it is
-  installed, otherwise PyTorch SDPA.
-- `--patch-embed linear` computes the vision patch embedding as one GEMM. Use it
-  where BF16 Conv3d is slow, such as PyTorch 2.9 on DGX Spark (GB10).
-- `VisionFeatureCache` (Python API) reuses vision features of frames already
-  encoded in earlier calls of a stream, so consecutive time steps encode only the
-  newest frame of each camera.
+- `--accel compile` or `--accel tuned` runs the prompt prefill, CoT decoding
+  (including sampling) and the flow-matching loop with `torch.compile` and CUDA
+  graphs; the vision encoder runs eagerly. `tuned` also autotunes the decode
+  step. The first input compiles and captures the graphs; later inputs with the
+  same shapes replay them. Without FlashAttention 2, `--accel` stops with an
+  error.
+- `--accel-attention` selects the attention kernel inside the prefill graph. The
+  default `auto` uses FlashAttention 3 on Hopper when it is installed, otherwise
+  PyTorch SDPA.
 
 Caveats:
 
-- The first call for each new input shape compiles and captures graphs inline:
-  about 2 minutes for the first one-CoT call from an empty compiler cache on an
-  H100, much less with a populated one (six graphs in 23 s). Set
-  `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` to keep the cache across
-  processes.
+- The first call for each new input shape compiles and captures graphs inline.
+  Set `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` to keep the compiler cache
+  across processes.
 - Graph shapes are static. A new image resolution, a prompt that crosses a
   256-token bucket, or a different CoT count, generation length or sampling
-  setting builds new graphs on first use. With the ViT cache, the first two
-  seconds of a stream also build up to six extra vision graphs (11–13 s each);
-  [warm up](docs/acceleration.md#compilation-shapes-and-memory) with a recorded
-  stream to keep them out of live operation.
+  setting builds new graphs on first use;
+  [warm up](docs/acceleration.md#compilation-shapes-and-memory) to keep them out
+  of live operation.
 - With several CoTs, the prefill runs eagerly and the expert graph replays only
-  when all CoTs have the same length, so six CoTs ran 2.3x faster rather than
-  7.5x.
-- The ViT cache helps only for consecutive time steps of one stream. Call
-  `clear()` when the stream changes and after changing the model.
+  when all CoTs have the same length.
 - Accelerated outputs are not bitwise identical to the default path: compiled
   kernels round BF16 differently, which can change a sampled token where two
-  candidates are nearly tied. On 33 samples, every minADE difference had a 95%
-  interval that included zero. The 2,643-sample evaluation of an earlier
-  prototype covers `--accel tuned` with FlashAttention 3 (no measurable change).
-  In that evaluation, `compile` with SDPA attention changed greedy minADE by a
-  small but significant +0.2%. The SDPA configurations that the release
-  environment uses are covered only by the 33-sample check
-  ([details](docs/validation.md#inference-acceleration)).
+  candidates are nearly tied.
 
 The [acceleration guide](docs/acceleration.md) covers requirements, the Python
-API, which calls are graphed and the ViT cache. [Validation
-results](docs/validation.md#inference-acceleration) list the measured latency
-and parity.
+API and which calls are graphed; [validation results](docs/validation.md#inference-acceleration)
+record the measured parity and latency.
 
 For development, run `uv run --locked pytest`. See
 [validation results and reproduction commands](docs/validation.md) for the
-recorded EA and GA checkpoint download and PhysicalAI-AV GPU inference checks.
+recorded checkpoint download and PhysicalAI-AV GPU inference checks.
 Inference components are adapted from
 [Alpamayo 2 Super, commit 5e7975f](https://github.com/NVlabs/alpamayo2/tree/5e7975f4a2100ee8ac1a62b79239bbabefddcbef).
 Source code is distributed under [Apache-2.0](LICENSE); checkpoint access and its

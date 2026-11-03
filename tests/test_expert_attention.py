@@ -1,17 +1,17 @@
-"""Numerical CPU regressions for Qwen3-VL expert attention and cache reuse."""
+"""Numerical CPU regressions for Cosmos3-Edge expert attention and cache reuse."""
 
 import copy
 import math
 
 import pytest
 import torch
-from transformers.models.qwen3_vl import Qwen3VLTextConfig, Qwen3VLTextModel
+from transformers import Cosmos3EdgeTextConfig, Cosmos3EdgeTextModel
 
 from alpamayo2_edge.models.expert_utils import build_expert_pos_ids_and_attn_mask
 
 
 def _text_config(attention_backend="sdpa"):
-    config = Qwen3VLTextConfig(
+    config = Cosmos3EdgeTextConfig(
         vocab_size=32,
         hidden_size=64,
         intermediate_size=96,
@@ -20,7 +20,7 @@ def _text_config(attention_backend="sdpa"):
         num_key_value_heads=2,
         head_dim=16,
         max_position_embeddings=128,
-        rope_scaling={"rope_type": "default", "mrope_section": [2, 3, 3]},
+        rope_parameters={"rope_type": "default", "mrope_section": [2, 3, 3]},
         attention_dropout=0.0,
     )
     config._attn_implementation = attention_backend
@@ -31,7 +31,7 @@ def _text_config(attention_backend="sdpa"):
 def expert_backbone(request):
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(37)
-        model = Qwen3VLTextModel(_text_config(request.param)).eval()
+        model = Cosmos3EdgeTextModel(_text_config(request.param)).eval()
     return model
 
 
@@ -58,7 +58,7 @@ def _prefix_cache(model):
     prefix_config.intermediate_size = 192
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(31)
-        prefix_model = Qwen3VLTextModel(prefix_config).eval()
+        prefix_model = Cosmos3EdgeTextModel(prefix_config).eval()
     generator = torch.Generator().manual_seed(23)
     return prefix_model(
         inputs_embeds=torch.randn(1, 5, 128, generator=generator),
@@ -196,7 +196,7 @@ def test_expert_state_dict_preserves_attention_and_action_projection_geometry():
         "expert.layers.0.self_attn.k_proj.weight": (32, 64),
         "expert.layers.0.self_attn.v_proj.weight": (32, 64),
         "expert.layers.0.self_attn.o_proj.weight": (64, 64),
-        "expert.layers.1.mlp.down_proj.weight": (64, 96),
+        "expert.layers.1.mlp.fc2.weight": (64, 96),
         "action_in_proj.encoder.trunk.0.weight": (32, 12),
         "action_in_proj.encoder.trunk.3.weight": (64, 32),
         "action_out_proj.weight": (2, 64),

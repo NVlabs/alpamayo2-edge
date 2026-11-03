@@ -1,10 +1,12 @@
 """Input contracts that protect camera, timestamp, and trajectory alignment."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from alpamayo2_edge import helper
 from alpamayo2_edge.helper import create_messages, to_device
 from alpamayo2_edge.sample import canonicalize_sample, validate_sample
 
@@ -132,3 +134,66 @@ def test_to_device_keeps_integer_and_boolean_tensors():
     assert moved["mask"].dtype == torch.bool
     assert moved["nested"][0].dtype == torch.bfloat16
     assert moved["nested"][1][0].dtype == torch.bfloat16
+
+
+def test_patch_normalization_matches_the_processor_layout():
+    from transformers import Cosmos3EdgeImageProcessor
+
+    # Unequal channel statistics catch a wrong channel stride.
+    processor = Cosmos3EdgeImageProcessor(image_mean=[0.1, 0.5, 0.9], image_std=[0.2, 0.4, 0.8])
+    image = torch.randint(0, 256, (3, 64, 96), dtype=torch.uint8)
+    raw = processor(
+        images=[image], do_resize=False, do_rescale=False, do_normalize=False, return_tensors="pt"
+    )["pixel_values"]
+    expected = processor(images=[image], do_resize=False, return_tensors="pt")["pixel_values"]
+    torch.testing.assert_close(helper._normalize_patches(raw, processor), expected)
+
+
+class _TemplateOnlyProcessor:
+    image_processor = SimpleNamespace(patch_size=16, merge_size=2)
+
+    def __init__(self, closed: bool):
+        self.closed = closed
+        self.kwargs = None
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.kwargs = kwargs
+        thinking = (
+            "<think></think>" if self.closed and not kwargs["enable_thinking"] else "<think>\n"
+        )
+        return "<|im_start|>assistant\n" + thinking
+
+    def __call__(self, **kwargs):
+        raise StopIteration
+
+
+@pytest.mark.parametrize("closed", [True, False])
+def test_driving_prompt_disables_thinking(monkeypatch, closed):
+    processor = _TemplateOnlyProcessor(closed)
+    monkeypatch.setattr(helper, "get_processor", lambda tokenizer, model_config: processor)
+    if closed:
+        with pytest.raises(StopIteration):
+            helper.prepare_model_inputs(raw_sample(), config(), tokenizer=None)
+    else:
+        with pytest.raises(ValueError, match="<think></think>"):
+            helper.prepare_model_inputs(raw_sample(), config(), tokenizer=None)
+    assert processor.kwargs["enable_thinking"] is False
+
+
+@pytest.mark.skipif(
+    "ALPAMAYO2_EDGE_CHECKPOINT" not in os.environ,
+    reason="set ALPAMAYO2_EDGE_CHECKPOINT to a local checkpoint directory",
+)
+def test_local_checkpoint_prompt_ends_with_closed_thinking():
+    from transformers import AutoConfig
+
+    from alpamayo2_edge.config import build_alpamayo2_edge_tokenizer
+
+    path = os.environ["ALPAMAYO2_EDGE_CHECKPOINT"]
+    model_config = AutoConfig.from_pretrained(path)
+    tokenizer = build_alpamayo2_edge_tokenizer(path)
+    inputs = helper.prepare_model_inputs(raw_sample(), model_config, tokenizer)["tokenized_data"]
+    text = tokenizer.decode(inputs["input_ids"][0])
+    assert text.endswith("<|im_start|>assistant\n<think></think>")
+    image_tokens = inputs["input_ids"].eq(model_config.vlm_config.image_token_id)
+    torch.testing.assert_close(inputs["mm_token_type_ids"], image_tokens.long())

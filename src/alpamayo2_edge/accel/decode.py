@@ -25,10 +25,8 @@ from transformers.generation.logits_process import (
 )
 from transformers.generation.stopping_criteria import EosTokenCriteria, MaxLengthCriteria
 from transformers.generation.utils import GenerateDecoderOnlyOutput, GenerationMixin
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLCausalLMOutputWithPast,
-    apply_rotary_pos_emb,
-)
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.cosmos3_edge.modeling_cosmos3_edge import apply_rotary_pos_emb
 
 from alpamayo2_edge.accel.graphs import (
     AccelStats,
@@ -194,7 +192,7 @@ class FlashKVCache(Cache):
 
 
 def decoder_block(layer, hidden, cos, sin, k_cache, v_cache, seqlens, causal: bool):
-    """``Qwen3VLTextDecoderLayer.forward`` with the cache update and attention fused.
+    """``Cosmos3EdgeTextDecoderLayer.forward`` with the cache update and attention fused.
 
     Every other operation is the layer's own module, so autocast dtypes match
     eager. Eager feeds attention keys/queries after RoPE (FP32 when the residual
@@ -204,8 +202,8 @@ def decoder_block(layer, hidden, cos, sin, k_cache, v_cache, seqlens, causal: bo
     attn = layer.self_attn
     rows, seq, _ = hidden.shape
     x = layer.input_layernorm(hidden)
-    q = attn.q_norm(attn.q_proj(x).view(rows, seq, -1, attn.head_dim))
-    k = attn.k_norm(attn.k_proj(x).view(rows, seq, -1, attn.head_dim))
+    q = attn.q_proj(x).view(rows, seq, -1, attn.head_dim)
+    k = attn.k_proj(x).view(rows, seq, -1, attn.head_dim)
     v = attn.v_proj(x).view(rows, seq, -1, attn.head_dim)
     q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
     dtype = k_cache.dtype
@@ -224,7 +222,7 @@ def decoder_block(layer, hidden, cos, sin, k_cache, v_cache, seqlens, causal: bo
 
 
 def prefill_block(layer, hidden, cos, sin, k_cache, v_cache, kv_only: bool, fa3: bool):
-    """``Qwen3VLTextDecoderLayer.forward`` over the uncached prompt, writing its K/V.
+    """``Cosmos3EdgeTextDecoderLayer.forward`` over the uncached prompt, writing its K/V.
 
     Attention is HF's causal SDPA call (or FA3); ``kv_only`` stops after the K/V
     write because the last layer's prompt output is never used.
@@ -232,8 +230,8 @@ def prefill_block(layer, hidden, cos, sin, k_cache, v_cache, kv_only: bool, fa3:
     attn = layer.self_attn
     rows, seq, _ = hidden.shape
     x = layer.input_layernorm(hidden)
-    q = attn.q_norm(attn.q_proj(x).view(rows, seq, -1, attn.head_dim))
-    k = attn.k_norm(attn.k_proj(x).view(rows, seq, -1, attn.head_dim))
+    q = attn.q_proj(x).view(rows, seq, -1, attn.head_dim)
+    k = attn.k_proj(x).view(rows, seq, -1, attn.head_dim)
     v = attn.v_proj(x).view(rows, seq, -1, attn.head_dim)
     if fa3:
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
@@ -284,7 +282,7 @@ class DecodeStep(torch.nn.Module):
 
 
 class PrefillStep(torch.nn.Module):
-    """``Qwen3VLTextModel.forward`` over right-padded prompt embeddings, with DeepStack.
+    """``Cosmos3EdgeTextModel.forward`` over right-padded prompt embeddings.
 
     Padding follows every real token, so the causal mask hides it from them; its
     K/V land beyond the cache length and decoding overwrites them.
@@ -295,7 +293,7 @@ class PrefillStep(torch.nn.Module):
         self.text = vlm.model.language_model
         self.fa3 = fa3
 
-    def forward(self, hidden, positions, visual_index, deepstack, k_caches, v_caches):
+    def forward(self, hidden, positions, k_caches, v_caches):
         text = self.text
         cos, sin = text.rotary_emb(hidden, positions)
         last = len(text.layers) - 1
@@ -310,9 +308,6 @@ class PrefillStep(torch.nn.Module):
                 index == last,
                 self.fa3,
             )
-            if index < len(deepstack):
-                # Qwen3VLTextModel._deepstack_process: one add per visual token.
-                hidden = hidden.index_add(1, visual_index, deepstack[index].unsqueeze(0))
         return hidden
 
 
@@ -688,7 +683,7 @@ class DecodeAccelerator:
         """Prefill one image prompt into the flash cache as one graph replay.
 
         Embeddings, vision features and their scatter, and ``get_rope_index`` are
-        ``Qwen3VLModel.forward``'s own steps; the rope index runs on host copies,
+        ``Cosmos3EdgeModel.forward``'s own steps; the rope index runs on host copies,
         which gives the same integer positions without per-image device syncs. The
         decoder stack runs over the prompt right-padded to a ``kv_bucket`` multiple.
         """
@@ -708,12 +703,10 @@ class DecodeAccelerator:
             data["pixel_values"], data["image_grid_thw"], return_dict=True
         )
         image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(embeds.device, embeds.dtype)
-        deepstack = image_outputs.deepstack_features
         image_mask, _ = vlm_model.get_placeholder_mask(
             input_ids, inputs_embeds=embeds, image_features=image_embeds
         )
         embeds = embeds.masked_scatter(image_mask, image_embeds)
-        visual_index = image_mask[0, :, 0].nonzero().squeeze(1)
         positions, rope_deltas = vlm_model.get_rope_index(
             input_ids.cpu(),
             data["mm_token_type_ids"][:, :-1].cpu(),
@@ -724,35 +717,23 @@ class DecodeAccelerator:
         vlm_model.rope_deltas = rope_deltas.to(embeds.device)
         n_prompt = input_ids.shape[1]
         padded = bucket(n_prompt, self.kv_bucket)
-        key = (
-            cache.max_len,
-            padded,
-            visual_index.numel(),
-            len(deepstack),
-            id(cache.k[0]),
-            autocast_state(embeds.device.type),
-        )
+        key = (cache.max_len, padded, id(cache.k[0]), autocast_state(embeds.device.type))
         graph = self.prefill_graphs.get(key)
         if graph is None:
             static = (
                 embeds.new_zeros(1, padded, embeds.shape[-1]),
                 torch.zeros(3, 1, padded, dtype=positions.dtype, device=embeds.device),
-                visual_index.clone(),
-                [features.clone() for features in deepstack],
                 cache.k,
                 cache.v,
             )
-            graph = self.graphed("prefill", key[:4], self.compiled_prefill, static)
+            graph = self.graphed("prefill", key[:2], self.compiled_prefill, static)
             self.prefill_graphs[key] = graph
-        hidden_in, positions_in, index_in, deepstack_in = graph.args[:4]
+        hidden_in, positions_in = graph.args[:2]
         hidden_in[:, :n_prompt].copy_(embeds)
         hidden_in[:, n_prompt:].zero_()
         positions = positions.to(embeds.device)
         positions_in[:, :, :n_prompt].copy_(positions)
         positions_in[:, :, n_prompt:].copy_(positions[:, :, -1:])
-        index_in.copy_(visual_index)
-        for target, features in zip(deepstack_in, deepstack, strict=True):
-            target.copy_(features)
         graph()
         cache.start(n_prompt, vlm_model.rope_deltas.reshape(-1))
         return True
@@ -788,6 +769,4 @@ class DecodeAccelerator:
         cache.seqlens.fill_(cache.length)
         logits = self._step_graph(cache)()
         cache.length += 1
-        return Qwen3VLCausalLMOutputWithPast(
-            logits=logits, past_key_values=cache, rope_deltas=self.vlm.model.rope_deltas
-        )
+        return CausalLMOutputWithPast(logits=logits, past_key_values=cache)
