@@ -46,6 +46,7 @@ hf auth login
 
 python -m alpamayo2_edge.inference \
     --model-id nvidia/Alpamayo2-Edge \
+    --revision ed1f86a5026355850b4fb4831f92f99ac5ada6aa \
     --manifest examples/nav_samples.json \
     --output outputs/physicalai-nav
 ```
@@ -82,7 +83,7 @@ the clip, time, navigation text, and resolved dataset revision.
 ## Download the model for local use
 
 Authenticate using `hf auth login` or an existing `HF_TOKEN`, then download the
-model. The repository contains both model shards, tokenizer and
+immutable revision. The repository contains both model shards, tokenizer and
 processor assets, configuration, and a model card template. Allow approximately
 5.3 GB of disk space for the model. Examples stay in this GitHub repository and
 their image data is loaded separately from PhysicalAI-AV.
@@ -93,6 +94,7 @@ from huggingface_hub import snapshot_download
 
 snapshot_download(
     repo_id="nvidia/Alpamayo2-Edge",
+    revision="ed1f86a5026355850b4fb4831f92f99ac5ada6aa",
     local_dir=".work/Alpamayo2-Edge",
 )
 PY

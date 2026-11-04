@@ -60,6 +60,7 @@ to reproduce it:
 ```bash
 python -m alpamayo2_edge.inference \
     --model-id nvidia/Alpamayo2-Edge \
+    --revision <revision from the README> \
     --manifest examples/nav_samples.json \
     --num-traj-sets 6 --num-traj-samples 1 --seed 43 \
     --attn-implementation sdpa --output outputs/physicalai-nav
