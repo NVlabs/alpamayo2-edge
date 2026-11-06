@@ -67,6 +67,15 @@ python -m alpamayo2_edge.inference \
     --output outputs/physicalai-nav
 ```
 
+The [demo notebook](notebooks/inference.ipynb) runs the same example step by step: it
+shows the 22 camera inputs, runs six reasoning continuations, prints the reasoning and
+plots the predicted trajectories in a bird's-eye view. It also needs Jupyter and
+matplotlib:
+
+```bash
+uv run --locked --extra dataset --with jupyter --with matplotlib jupyter lab notebooks/inference.ipynb
+```
+
 `--manifest` selects index 0 by default; use `--sample-index` for other entries.
 Each entry supplies `clip_id`, `t0_us`, and `nav_text`. Use `--nav-text` to override
 the selected entry's navigation instruction. Direct `--clip-id` input requires
