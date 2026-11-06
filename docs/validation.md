@@ -3,9 +3,10 @@
 
 # Checkpoint validation
 
-The results below record checks of the released checkpoint performed on 2026-11-03. They
-are measurements of that date, not a fresh validation of every later code revision. The
-commands use the supported PhysicalAI-AV input path with local or Hugging Face model assets.
+The results below record checks of the checkpoint at the Hugging Face revision pinned in the
+README, performed on 2026-11-06. They are measurements of that date, not a fresh validation of
+every later code revision. The commands use the supported PhysicalAI-AV input path with local
+or Hugging Face model assets.
 
 ## Release assets and loading
 
@@ -30,7 +31,7 @@ with its supplied navigation instruction:
 | Field | Tested value |
 | --- | --- |
 | Dataset | `nvidia/PhysicalAI-Autonomous-Vehicles` |
-| Dataset revision | `39414de6f0ab867238ad6a0299fcd18b26081b42` |
+| Dataset revision | `2ac2e9c056e0c8426face5bfad64b0961a295b28` |
 | Clip | `ea7bbd31-b7a5-4972-8dbd-7089e6b53de4` |
 | Clip-relative anchor | 4,000,000 microseconds |
 | Navigation | `Turn right in 30m` |
@@ -43,11 +44,11 @@ The run was repeated with SDPA and with FlashAttention 2. Both reported no missi
 unexpected, or mismatched parameters and produced finite trajectories shaped
 `[1, 6, 1, 64, 3]` and `[1, 6, 1, 64, 3, 3]`. The packed inputs of the two runs were
 bitwise equal, all six reasoning texts were identical, and the trajectory endpoints
-differed by at most 1.9 cm. Every continuation decided to turn right at the
+differed by at most 1.3 cm. Every continuation decided to turn right at the
 intersection, for example "Decelerate and turn right at the intersection to follow our
 route." The saved fused prompt contains all 22 relative timestamp labels and the
 navigation instruction, and ends with `<think></think>`; no future trajectory was loaded
-as an input. The model call took 4.0 seconds for six continuations with SDPA.
+as an input. The model call took 3.6 seconds for six continuations with SDPA.
 
 The same SDPA run, with the model downloaded from Hugging Face into empty Hub and Xet
 caches, reproduced the packed inputs, generated token IDs, and trajectories bitwise.
@@ -79,8 +80,8 @@ bitwise equal in both comparisons.
 
 | Continuations | Generated tokens equal to the default path | Max endpoint difference | Model call, default → accelerated |
 | --- | --- | --- | --- |
-| 1 | 1 of 1 | 1.4 cm | 3.79 s → 1.48 s |
-| 6 | 6 of 6 | 2.2 cm | 3.95 s → 1.94 s |
+| 1 | 1 of 1 | 0.5 cm | 3.96 s → 1.68 s |
+| 6 | 6 of 6 | 2.2 cm | 4.01 s → 1.98 s |
 
 With six continuations the prefill ran eagerly, and so did the expert, because the
 continuations differed in length. This covers one example and seed; it is not a latency

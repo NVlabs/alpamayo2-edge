@@ -46,7 +46,7 @@ hf auth login
 
 python -m alpamayo2_edge.inference \
     --model-id nvidia/Alpamayo2-Edge \
-    --revision ed1f86a5026355850b4fb4831f92f99ac5ada6aa \
+    --revision f8951d095de3589b3face1dec3f4394c8ecedb38 \
     --manifest examples/nav_samples.json \
     --output outputs/physicalai-nav
 ```
@@ -94,7 +94,7 @@ from huggingface_hub import snapshot_download
 
 snapshot_download(
     repo_id="nvidia/Alpamayo2-Edge",
-    revision="ed1f86a5026355850b4fb4831f92f99ac5ada6aa",
+    revision="f8951d095de3589b3face1dec3f4394c8ecedb38",
     local_dir=".work/Alpamayo2-Edge",
 )
 PY
