@@ -1,30 +1,95 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
+<div align="center">
+
 # Alpamayo 2 Edge
 
-Standalone PyTorch inference for the Alpamayo 2 Edge checkpoint, a 2.65B-parameter model
-that includes a trajectory diffusion expert. The model is built on the Cosmos3-Edge
-vision-language backbone with a SigLIP2 vision encoder. Given six-camera observations,
-ego history, and a navigation instruction, it generates driving reasoning and 64 future
-poses at 0.1-second intervals.
+[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Model-Alpamayo2--Edge-blue)](https://huggingface.co/nvidia/Alpamayo2-Edge)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](./LICENSE)
+
+</div>
+
+NVIDIA Alpamayo 2 Edge is a 2B-parameter reasoning vision-language-action model that
+uses adaptive reasoning to generate driving trajectories and causal explanations.
+Built on the Nemotron-based backbone of NVIDIA Cosmos 3 Edge, it supports fine-tuning
+and efficient in-vehicle deployment on NVIDIA DRIVE AGX Thor.
+
+This repository provides standalone PyTorch inference for the released checkpoint.
+Given six-camera observations, ego history, and a navigation instruction, the model
+generates driving reasoning and 64 future poses at 0.1-second intervals.
+
+<p align="center">
+  <img src="./fig/alpamayo2edge_arch.webp" alt="NVIDIA Alpamayo 2 Edge architecture">
+</p>
 
 Model access requires an authorized Hugging Face account. The weights are in
-[nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge); use the code at
-`ga-release` or later. Decoded positions follow the course, the rear axle's direction of
+[nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge).
+Decoded positions follow the course, the rear axle's direction of
 travel, and decoded rotations estimate the body yaw, which differs from the path tangent
-by the rear-axle sideslip of the training vehicle.
+by the rear-axle sideslip.
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Setup](#setup)
+- [Run a PhysicalAI-AV navigation example](#run-a-physicalai-av-navigation-example)
+- [Notebook inference](#notebook-inference)
+  - [Freeform VQA](#freeform-vqa)
+- [Download the model for local use](#download-the-model-for-local-use)
+- [Sampling settings](#sampling-settings)
+- [Dataset input profile](#dataset-input-profile)
+- [Python API](#python-api)
+- [Accelerated inference](#accelerated-inference)
+- [Tests](#tests)
+- [Contributing](#contributing)
+- [Support](#support)
+- [License](#license)
+
+## Prerequisites
+
+- A Linux host with an NVIDIA GPU, BF16 support, a compatible CUDA driver,
+  and enough GPU memory for inference.
+- Python 3.12.
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/) for environment management.
+- Access to
+  [Alpamayo 2 Edge](https://huggingface.co/nvidia/Alpamayo2-Edge) and
+  [PhysicalAI-Autonomous-Vehicles](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles)
+  on Hugging Face.
+- For accelerated inference: FlashAttention 2. See the
+  [acceleration requirements](docs/acceleration.md#requirements).
 
 ## Setup
 
-Use Python 3.12 and a CUDA GPU for full model inference. Dependencies pin PyTorch
-2.8.0, torchvision 0.23.0, and Transformers 5.17.0, which provides the Cosmos3-Edge
-backbone. From this repository:
+Run these commands from the repository root. Dependencies pin PyTorch 2.8.0,
+torchvision 0.23.0, and Transformers 5.17.0, which provides the Cosmos3-Edge backbone.
 
 ```bash
+export UV_PROJECT_ENVIRONMENT=.venv
 uv sync --locked --dev
 source .venv/bin/activate
 ```
+
+`UV_PROJECT_ENVIRONMENT` selects the environment used by the commands below.
+Check the CLI and CUDA environment before loading the model:
+
+```bash
+python -m alpamayo2_edge.inference --help
+python - <<'PY'
+import sys
+import torch
+
+print("python:", sys.executable)
+print("torch:", torch.__version__)
+print("cuda_runtime:", torch.version.cuda)
+print("cuda_available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("device:", torch.cuda.get_device_name(0))
+    print("bf16_supported:", torch.cuda.is_bf16_supported())
+PY
+```
+
+For the default GPU inference path, `cuda_available` and `bf16_supported` must be `True`.
 
 The default attention backend is PyTorch SDPA; installation does not build
 FlashAttention. FlashAttention 2.8.3 is an optional `flash` extra for environments
@@ -67,36 +132,6 @@ python -m alpamayo2_edge.inference \
     --output outputs/physicalai-nav
 ```
 
-The [demo notebook](notebooks/inference.ipynb) runs the same example step by step: it
-shows the 22 camera inputs, runs six reasoning continuations, prints the reasoning and
-plots the predicted trajectories in a bird's-eye view. The `notebook` extra includes
-the PhysicalAI-AV SDK, Jupyter, and matplotlib. From the repository root:
-
-```bash
-uv sync --locked --extra notebook
-source .venv/bin/activate
-jupyter lab notebooks/inference.ipynb
-```
-
-`uv lock` updates the lockfile. Run `uv sync --locked --extra notebook` to install
-the locked notebook dependencies.
-
-The optional accelerated inference section also plots the trajectories from its
-final timed call. Candidate numbers match the reasoning shown above each plot.
-
-The notebook's freeform VQA section answers a question about the same scene.
-It loads separate VQA inputs with `load_physical_aiavdataset_vqa`. These inputs
-contain six cameras, four frames per camera, and 24 images in total.
-The requested times are −0.3, −0.2, −0.1, and 0 seconds
-relative to t0. Time labels use the actual capture times. Every camera uses an
-image budget of 163840 to 196608 pixels.
-
-For example, ask how the ego vehicle should drive or which hazards are visible.
-The VLM generates text without trajectory diffusion. The prompt contains camera
-names, time labels, images, and the question. It omits navigation and ego history.
-The assistant prefix has no empty `<think></think>` suffix. The VQA figure shows
-all 24 input frames, the question, and the complete answer.
-
 `--manifest` selects index 0 by default; use `--sample-index` for other entries.
 Each entry supplies `clip_id`, `t0_us`, and `nav_text`. Use `--nav-text` to override
 the selected entry's navigation instruction. Direct `--clip-id` input requires
@@ -109,6 +144,42 @@ processor then builds the prompt and model inputs. Hugging Face access and
 streaming are handled by `physical-ai-av`; `HF_HUB_CACHE` can select its cache
 location. `--local-files-only` controls model loading only. Output records include
 the clip, time, navigation text, and resolved dataset revision.
+
+## Notebook inference
+
+The [demo notebook](notebooks/inference.ipynb) runs the same example step by step: it
+shows the 22 camera inputs, runs six reasoning continuations, prints the reasoning and
+plots the predicted trajectories in a bird's-eye view. The `notebook` extra includes
+the PhysicalAI-AV SDK, Jupyter, and matplotlib. From the repository root:
+
+```bash
+uv sync --locked --extra notebook
+source .venv/bin/activate
+hf auth login
+jupyter lab notebooks/inference.ipynb
+```
+
+Select the `Python 3 (ipykernel)` kernel from this environment.
+Run the cells in order. Set `MODEL_ID` to a local model directory to use downloaded weights.
+
+`uv lock` updates the lockfile. Run `uv sync --locked --extra notebook` to install
+the locked notebook dependencies.
+
+The optional accelerated inference section also plots the trajectories from its
+final timed call. Candidate numbers match the reasoning shown above each plot.
+
+### Freeform VQA
+
+The notebook's freeform VQA section answers a question about the same scene.
+It loads separate VQA inputs with `load_physical_aiavdataset_vqa`.
+This notebook example uses six cameras with four frames per camera, for 24 images in total.
+
+Set `QUESTION` in the VQA section. Set `MAX_VQA_TOKENS` to limit the answer length.
+For example, ask how the ego vehicle should drive or which hazards are visible.
+The VLM generates text without trajectory diffusion. The prompt contains camera
+names, time labels, images, and the question. It omits navigation and ego history.
+The assistant prefix has no empty `<think></think>` suffix. The VQA figure shows
+all 24 input frames, the question, and the complete answer.
 
 ## Download the model for local use
 
@@ -163,8 +234,8 @@ Use `--revision` to select an immutable HF snapshot. Other options include
 `--seed`, `--diffusion-steps`,
 `--max-generation-length`, `--device`, and `--dtype`; see `--help`.
 
-The driving prompt ends with an empty `<think></think>` block, as in training, so the
-model writes its driving reasoning directly; the decoded `cot` omits that block.
+The driving prompt ends with an empty `<think></think>` block. The model writes its
+driving reasoning directly. The decoded `cot` omits that block.
 
 Each sample's output directory contains `output.safetensors` with `pred_xyz`,
 `pred_rot`, and generated token IDs; `output.json` with decoded text and shape
@@ -295,7 +366,41 @@ Caveats:
 The [acceleration guide](docs/acceleration.md) covers requirements, the Python
 API and which calls are graphed.
 
-For development, run `uv run --locked pytest`.
+## Tests
+
+Run the tests from the repository root with the environment from Setup:
+
+```bash
+source .venv/bin/activate
+python -m pytest
+```
+
+Checkpoint-specific tests run when `ALPAMAYO2_EDGE_CHECKPOINT` points to a local
+model directory. For example, use the model downloaded above:
+
+```bash
+ALPAMAYO2_EDGE_CHECKPOINT="$EDGE_MODEL" python -m pytest
+```
+
+These tests check the checkpoint configuration and tokenizer inputs. They do not
+run full model inference. CUDA graph tests require a CUDA GPU and FlashAttention 2.
+Tests with unavailable prerequisites are skipped.
+
+For a full inference check, run the
+[PhysicalAI-AV navigation example](#run-a-physicalai-av-navigation-example).
+It checks trajectory shapes and finite values, then writes the outputs and `report.json`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, checks, and pull request instructions.
+
+## Support
+📣 **Usage questions and discussion**: please join us on [Alpamayo NV Developer Forum](https://forums.developer.nvidia.com/c/autonomous-vehicles/alpamayo/766).
+🐛 **Code-level bugs, documentation issues, and feature requests**: file a [GitHub issue](../../issues/new/choose) using the appropriate template (Bug report, Documentation request, or Feature request). The relevant NVIDIA responder is auto-assigned via the `assignees:` field on the template.
+🚨 **Security vulnerabilities**: follow [SECURITY.md](SECURITY.md) to report them privately to NVIDIA. Do not report vulnerabilities in public issues, discussions, or pull requests.
+
+## License
+
 Inference components are adapted from
 [Alpamayo 2 Super, commit 5e7975f](https://github.com/NVlabs/alpamayo2/tree/5e7975f4a2100ee8ac1a62b79239bbabefddcbef).
 Source code is distributed under [Apache-2.0](LICENSE); checkpoint access and its
