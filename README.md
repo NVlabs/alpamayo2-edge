@@ -406,7 +406,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, checks, and pull r
 
 ## License
 
-Inference components are adapted from
-[Alpamayo 2 Super, commit 5e7975f](https://github.com/NVlabs/alpamayo2/tree/5e7975f4a2100ee8ac1a62b79239bbabefddcbef).
-Source code is distributed under [Apache-2.0](LICENSE); checkpoint access and its
-model-card terms are separate.
+Source code as provided in this repository: Apache License 2.0 - see [LICENSE](LICENSE) for details.
+
+Model weights on Huggingface [nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge) are released under the [OpenMDW-1.1](https://openmdw.ai/license/1-1/) license.
