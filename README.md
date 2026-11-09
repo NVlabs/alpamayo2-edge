@@ -247,6 +247,9 @@ and rotations have shape `[1, 6, 1, 64, 3, 3]`.
 
 ## Dataset input profile
 
+This is the recommended data loading setup for CoC-traj inference, which generates
+driving reasoning and predicts future trajectories.
+
 `load_physical_aiavdataset` returns an in-memory dictionary for
 `prepare_model_inputs`, including these tensors:
 
@@ -396,7 +399,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, checks, and pull r
 
 ## Support
 📣 **Usage questions and discussion**: please join us on [Alpamayo NV Developer Forum](https://forums.developer.nvidia.com/c/autonomous-vehicles/alpamayo/766).
+
 🐛 **Code-level bugs, documentation issues, and feature requests**: file a [GitHub issue](../../issues/new/choose) using the appropriate template (Bug report, Documentation request, or Feature request). The relevant NVIDIA responder is auto-assigned via the `assignees:` field on the template.
+
 🚨 **Security vulnerabilities**: follow [SECURITY.md](SECURITY.md) to report them privately to NVIDIA. Do not report vulnerabilities in public issues, discussions, or pull requests.
 
 ## License

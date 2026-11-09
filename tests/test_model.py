@@ -139,7 +139,6 @@ def _sampling_model(monkeypatch, *, include_anchor=True, cache_length=5):
         ),
         action_in_proj=lambda x, t: x,
         action_out_proj=lambda x: x,
-        expert=SimpleNamespace(__call__=denoiser),
         config=SimpleNamespace(expert_non_causal_attention=True),
         diffusion=FlowMatching(x_dims=(4, 2)),
     )

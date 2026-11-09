@@ -96,7 +96,7 @@ class UnicycleAccelCurvatureCourseActionSpace(UnicycleAccelCurvatureActionSpace)
     ``yaw_k = course_k - theta0 + slip_gradient * (a_lat_k - a_lat_0)`` with
     ``a_lat = v * d(course)/dt``, so the yaw is 0 at t0 and continuous with the history.
     ``slip_gradient`` [rad per m/s^2] is the rear-axle sideslip gradient of the rig the model was
-    trained for. It is frozen into the checkpoint config, and no deployment path overrides it yet.
+    trained for.
     The GT egomotion dead-reckons positions with the rig's sideslip angle gradient (1.4e-3 to
     5.3e-3 across platforms); the default 2.5e-3 is the Hyperion 8 Lincoln rig's. It changes only
     the rotations, never the positions or the encoding.

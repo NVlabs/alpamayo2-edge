@@ -425,7 +425,7 @@ def test_generation_limit_on_anchor_completes_the_flash_cache(monkeypatch):
     assert handle.describe()["fallbacks"] == {}
 
 
-def test_padded_prompts_and_unsupported_samplers_fall_back(monkeypatch):
+def test_padded_prompts_fall_back(monkeypatch):
     model = _tiny_model(monkeypatch)
     inputs = _image_inputs()
     data = inputs["tokenized_data"]

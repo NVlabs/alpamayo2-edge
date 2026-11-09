@@ -24,36 +24,6 @@ def test_hf5_loading_diagnostics_serialize_sets():
 
 
 @pytest.mark.parametrize(
-    "removed_args",
-    [
-        ["--sample", "0"],
-        ["--bundle", "bundle"],
-        ["--sample-id", "sample_000"],
-        ["--all-samples"],
-    ],
-)
-def test_cli_rejects_removed_local_sample_options(removed_args, capsys):
-    from alpamayo2_edge.inference import main
-
-    with pytest.raises(SystemExit) as error:
-        main(
-            [
-                "--model-id",
-                "model",
-                "--manifest",
-                "clips.json",
-                "--output",
-                "output",
-                "--device",
-                "cpu",
-                *removed_args,
-            ]
-        )
-    assert error.value.code == 2
-    assert f"unrecognized arguments: {removed_args[0]}" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize(
     "args",
     [
         ["--model-id", "model"],

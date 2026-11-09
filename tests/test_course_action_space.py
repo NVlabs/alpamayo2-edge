@@ -1,9 +1,7 @@
-"""Course-heading action space: parity with the training implementation and inference contract.
+"""Check course-heading action space outputs against a fixed reference.
 
-``data/course_action_space_reference.safetensors`` holds the training code's float64 encode/decode
-outputs for the scenarios below. Regenerate it with the Alpamayo training package importable:
-
-    PYTHONPATH=src:/path/to/alpamayo/src python tests/test_course_action_space.py
+``data/course_action_space_reference.safetensors`` stores frozen float64 encode and decode
+outputs for the synthetic scenarios below.
 """
 
 import math
@@ -188,7 +186,7 @@ def reference() -> dict[str, torch.Tensor]:
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
 @pytest.mark.parametrize("prefix", ["course", "yaw"])
-def test_encode_and_decode_match_training_implementation(reference, prefix, dtype):
+def test_encode_and_decode_match_reference(reference, prefix, dtype):
     from alpamayo2_edge.action_space import (
         UnicycleAccelCurvatureActionSpace,
         UnicycleAccelCurvatureCourseActionSpace,
@@ -264,35 +262,3 @@ def test_slip_gradient_changes_only_decoded_rotations():
     ]
     torch.testing.assert_close(decoded[0][0], decoded[1][0], rtol=0, atol=0)
     assert (_yaw(decoded[0][1]) - _yaw(decoded[1][1])).abs().amax() > 1e-3
-
-
-def _write_reference(path: Path) -> None:
-    """Record the training implementation's outputs (requires the Alpamayo training package)."""
-    from alpamayo.action_space import (
-        UnicycleAccelCurvatureActionSpace,
-        UnicycleAccelCurvatureCourseActionSpace,
-    )
-    from safetensors.torch import save_file
-
-    inputs = scenario_batch(torch.float64)
-    outputs = {
-        **compute_outputs(UnicycleAccelCurvatureCourseActionSpace(**COURSE_CFG), inputs, "course"),
-        **compute_outputs(UnicycleAccelCurvatureActionSpace(**YAW_CFG), inputs, "yaw"),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        raise FileExistsError(f"Refusing to overwrite {path}; delete it first to regenerate.")
-    save_file(
-        {key: value.contiguous() for key, value in outputs.items()},
-        str(path),
-        metadata={
-            "source": "alpamayo.action_space",
-            "dtype": "float64",
-            "torch": torch.__version__,
-            "scenarios": ",".join(SCENARIOS),
-        },
-    )
-
-
-if __name__ == "__main__":
-    _write_reference(DATA)
