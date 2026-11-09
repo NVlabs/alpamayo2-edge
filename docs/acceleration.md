@@ -15,9 +15,6 @@ always run eagerly.
 | `torch.compile` + CUDA graphs | `--accel compile` or `--accel tuned` | `enable_acceleration(model, AccelConfig(...))` | Same model; fused kernels change BF16 rounding |
 | Prefill attention | `--accel-attention auto\|fa3\|sdpa` | `AccelConfig(attention=...)` | Kernel choice inside the prefill graph |
 
-[Validation](validation.md#inference-acceleration) records the measured parity and
-latency on the public navigation example.
-
 ## Requirements
 
 - A CUDA GPU and a BF16 model (`--dtype bfloat16`, the default).

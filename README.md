@@ -272,12 +272,9 @@ Caveats:
   candidates are nearly tied.
 
 The [acceleration guide](docs/acceleration.md) covers requirements, the Python
-API and which calls are graphed; [validation results](docs/validation.md#inference-acceleration)
-record the measured parity and latency.
+API and which calls are graphed.
 
-For development, run `uv run --locked pytest`. See
-[validation results and reproduction commands](docs/validation.md) for the
-recorded checkpoint download and PhysicalAI-AV GPU inference checks.
+For development, run `uv run --locked pytest`.
 Inference components are adapted from
 [Alpamayo 2 Super, commit 5e7975f](https://github.com/NVlabs/alpamayo2/tree/5e7975f4a2100ee8ac1a62b79239bbabefddcbef).
 Source code is distributed under [Apache-2.0](LICENSE); checkpoint access and its
