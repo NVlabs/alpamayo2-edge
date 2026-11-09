@@ -8,8 +8,11 @@ import pytest
 import torch
 from scipy.spatial.transform import Rotation
 
-from alpamayo2_edge.load_physical_aiavdataset import load_physical_aiavdataset
-from alpamayo2_edge.sample import validate_sample
+from alpamayo2_edge.load_physical_aiavdataset import (
+    load_physical_aiavdataset,
+    load_physical_aiavdataset_vqa,
+)
+from alpamayo2_edge.sample import validate_sample, validate_vqa_sample
 
 CAMERAS = {
     "CAMERA_CROSS_LEFT_120FOV": 0,
@@ -216,6 +219,80 @@ def test_history_uses_full_rigid_transform_at_t0_without_querying_future():
     assert not any("future" in key for key in sample)
 
 
+def test_vqa_uses_six_cameras_with_four_frames_and_actual_capture_times():
+    dataset = Dataset()
+    dataset.revision = "test-dataset-revision"
+    del dataset.features.LABELS
+    sample = load_physical_aiavdataset_vqa("clip-123", avdi=dataset, maybe_stream=False)
+
+    validate_vqa_sample(sample)
+    assert sample["image_frames"].shape == (24, 1, 3, 4, 8)
+    assert sample["image_frames"].dtype == torch.uint8
+    assert sample["image_frames"].is_contiguous()
+    assert sample["camera_indices"].tolist() == [
+        camera_id for camera_id in CAMERAS.values() for _ in range(4)
+    ]
+    assert sample["image_frames"][:, 0, 0, 0, 0].tolist() == [
+        camera_id * 10 + frame_index for camera_id in CAMERAS.values() for frame_index in range(4)
+    ]
+    for camera in dataset.cameras.values():
+        assert len(camera.requests) == 1
+        assert camera.requests[0].tolist() == [4_800_000, 4_900_000, 5_000_000, 5_100_000]
+    assert sample["absolute_timestamps"].dtype == torch.int64
+    assert (
+        sample["absolute_timestamps"].tolist() == [4_799_983, 4_899_991, 4_999_977, 5_099_987] * 6
+    )
+    assert sample["camera_pixel_bounds"] == {
+        camera_id: (163840, 196608) for camera_id in CAMERAS.values()
+    }
+    assert sample["min_pixels"] == 163840
+    assert sample["max_pixels"] == 196608
+    assert sample["input_profile"] == "vqa_6cam_4f"
+    assert sample["clip_id"] == "clip-123"
+    assert sample["t0_us"] == 5_100_000
+    assert sample["provenance"] == {
+        "dataset": "nvidia/PhysicalAI-Autonomous-Vehicles",
+        "clip_id": "clip-123",
+        "t0_us": 5_100_000,
+        "dataset_revision": "test-dataset-revision",
+    }
+    assert not {"nav_text", "ego_history_xyz", "ego_history_rot"} & sample.keys()
+    assert dataset.ego.requests == []
+    assert len(dataset.requests) == 6
+    assert all(request[0] == "clip-123" and request[2] is False for request in dataset.requests)
+
+
+@pytest.mark.parametrize("t0_us", [True, 5_100_000.0, -1, 299_999, 2**63])
+def test_vqa_invalid_anchor_is_rejected_before_dataset_access(t0_us):
+    dataset = Dataset()
+    with pytest.raises((TypeError, ValueError), match="t0_us"):
+        load_physical_aiavdataset_vqa("clip-123", t0_us, avdi=dataset)
+    assert dataset.requests == []
+
+
+@pytest.mark.parametrize("clip_id", ["", "  ", None])
+def test_vqa_invalid_clip_is_rejected_before_dataset_access(clip_id):
+    dataset = Dataset()
+    with pytest.raises(ValueError, match="clip_id"):
+        load_physical_aiavdataset_vqa(clip_id, avdi=dataset)
+    assert dataset.requests == []
+
+
+def test_vqa_anchor_accepts_inclusive_clip_start_and_numpy_integer():
+    sample = load_physical_aiavdataset_vqa("clip-123", np.int64(300_000), avdi=Dataset())
+    assert sample["t0_us"] == 300_000
+    assert sample["absolute_timestamps"][::4].tolist() == [0] * 6
+
+
+@pytest.mark.parametrize("bounds", [[4_800_001, 10_000_000], [0, 5_099_999]])
+def test_vqa_requests_must_fit_camera_time_bounds(bounds):
+    dataset = Dataset()
+    dataset.cameras[0].timestamps = np.array(bounds, dtype=np.int64)
+    with pytest.raises(ValueError, match="CAMERA_CROSS_LEFT_120FOV.*range"):
+        load_physical_aiavdataset_vqa("clip-123", avdi=dataset)
+    assert dataset.cameras[0].requests == []
+
+
 @pytest.mark.parametrize("nav_text", ["", "  ", None, ["Go straight"]])
 def test_missing_navigation_is_rejected_before_dataset_access(nav_text):
     dataset = Dataset()
@@ -259,14 +336,19 @@ def test_requested_history_must_be_within_feature_time_bounds(feature):
         (lambda frames, times: (frames, times + 1_000_000), "timestamps"),
     ],
 )
-def test_malformed_decoder_outputs_fail_with_context(mutation, match):
+@pytest.mark.parametrize("vqa", [False, True])
+def test_malformed_decoder_outputs_fail_with_context(mutation, match, vqa):
     dataset = Dataset()
     dataset.cameras[0].mutate = mutation
     with pytest.raises((ValueError, TypeError), match=match):
-        load_physical_aiavdataset("clip-123", nav_text="Straight", avdi=dataset)
+        if vqa:
+            load_physical_aiavdataset_vqa("clip-123", avdi=dataset)
+        else:
+            load_physical_aiavdataset("clip-123", nav_text="Straight", avdi=dataset)
 
 
-def test_missing_optional_sdk_has_installation_hint(monkeypatch):
+@pytest.mark.parametrize("vqa", [False, True])
+def test_missing_optional_sdk_has_installation_hint(monkeypatch, vqa):
     original_import = builtins.__import__
 
     def without_dataset(name, *args, **kwargs):
@@ -276,4 +358,7 @@ def test_missing_optional_sdk_has_installation_hint(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", without_dataset)
     with pytest.raises(ImportError, match=r"alpamayo2-edge\[dataset\]"):
-        load_physical_aiavdataset("clip-123", nav_text="Straight")
+        if vqa:
+            load_physical_aiavdataset_vqa("clip-123")
+        else:
+            load_physical_aiavdataset("clip-123", nav_text="Straight")

@@ -69,12 +69,33 @@ python -m alpamayo2_edge.inference \
 
 The [demo notebook](notebooks/inference.ipynb) runs the same example step by step: it
 shows the 22 camera inputs, runs six reasoning continuations, prints the reasoning and
-plots the predicted trajectories in a bird's-eye view. It also needs Jupyter and
-matplotlib:
+plots the predicted trajectories in a bird's-eye view. The `notebook` extra includes
+the PhysicalAI-AV SDK, Jupyter, and matplotlib. From the repository root:
 
 ```bash
-uv run --locked --extra dataset --with jupyter --with matplotlib jupyter lab notebooks/inference.ipynb
+uv sync --locked --extra notebook
+source .venv/bin/activate
+jupyter lab notebooks/inference.ipynb
 ```
+
+`uv lock` updates the lockfile. Run `uv sync --locked --extra notebook` to install
+the locked notebook dependencies.
+
+The optional accelerated inference section also plots the trajectories from its
+final timed call. Candidate numbers match the reasoning shown above each plot.
+
+The notebook's freeform VQA section answers a question about the same scene.
+It loads separate VQA inputs with `load_physical_aiavdataset_vqa`. These inputs
+contain six cameras, four frames per camera, and 24 images in total.
+The requested times are −0.3, −0.2, −0.1, and 0 seconds
+relative to t0. Time labels use the actual capture times. Every camera uses an
+image budget of 163840 to 196608 pixels.
+
+For example, ask how the ego vehicle should drive or which hazards are visible.
+The VLM generates text without trajectory diffusion. The prompt contains camera
+names, time labels, images, and the question. It omits navigation and ego history.
+The assistant prefix has no empty `<think></think>` suffix. The VQA figure shows
+all 24 input frames, the question, and the complete answer.
 
 `--manifest` selects index 0 by default; use `--sample-index` for other entries.
 Each entry supplies `clip_id`, `t0_us`, and `nav_text`. Use `--nav-text` to override

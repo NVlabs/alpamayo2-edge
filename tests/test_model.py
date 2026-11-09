@@ -435,3 +435,40 @@ def test_cot_omits_the_closed_think_block():
     decoded = extract_text_tokens(tokenizer, torch.zeros(1, 1, dtype=torch.long))
     assert decoded["cot"] == ["Keep lane behind the truck."]
     assert decoded["raw_outputs"] == [text]
+
+
+@pytest.mark.parametrize("end_token_id", [2, 9])
+def test_vqa_stops_at_response_boundaries_and_returns_only_the_answer(monkeypatch, end_token_id):
+    from alpamayo2_edge.text_tasks import generate_vqa_answer
+
+    model = _tiny_model(monkeypatch)
+    original_generation = model.vlm.generation_config.to_dict()
+
+    class AnswerHead(torch.nn.Module):
+        step = 0
+
+        def forward(self, hidden):
+            logits = hidden.new_full((*hidden.shape[:-1], 128), -1000)
+            logits[..., 100] = 2000  # A discrete trajectory code must be masked.
+            logits[..., 6 if self.step == 0 else end_token_id] = 1000
+            self.step += 1
+            return logits
+
+    def decode(ids, skip_special_tokens):
+        assert skip_special_tokens
+        assert ids.tolist() == [[6, end_token_id]]  # No prompt or post-trajectory text.
+        return [" <think></think>Keep a safe distance. "]
+
+    model.vlm.lm_head = AnswerHead()
+    model.tokenizer = SimpleNamespace(pad_token_id=0, batch_decode=decode)
+    monkeypatch.setattr(model, "_sample_actions", lambda *a, **k: pytest.fail("VQA ran the expert"))
+    tokenized = {
+        "input_ids": torch.tensor([[1, 11, 10, 10, 10, 10, 12, 6]]),
+        "attention_mask": torch.ones(1, 8, dtype=torch.long),
+        "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        "pixel_values": torch.randn(16, 12),
+        "mm_token_type_ids": torch.tensor([[0, 0, 1, 1, 1, 1, 0, 0]]),
+    }
+    answer = generate_vqa_answer(model, {"tokenized_data": tokenized}, max_new_tokens=8)
+    assert answer == "Keep a safe distance."
+    assert model.vlm.generation_config.to_dict() == original_generation

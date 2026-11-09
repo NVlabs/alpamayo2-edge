@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 flash = ["flash-attn==2.8.3"]
 dataset = ["physical-ai-av==0.2.0"]
+notebook = ["physical-ai-av==0.2.0", "jupyter>=1.1.1", "matplotlib>=3.10"]
 
 [project.scripts]
 alpamayo2-edge = "alpamayo2_edge.inference:main"

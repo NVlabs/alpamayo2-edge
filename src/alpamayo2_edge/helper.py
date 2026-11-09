@@ -13,16 +13,16 @@ from torchvision.transforms.functional import InterpolationMode, resize
 from transformers import AutoProcessor
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
-from alpamayo2_edge.chat_template import CLOSED_THINKING, build_conversation
+from alpamayo2_edge.chat_template import (
+    CLOSED_THINKING,
+    build_conversation,
+    build_vqa_conversation,
+)
 from alpamayo2_edge.config import resolve_checkpoint_name_or_path
-from alpamayo2_edge.sample import canonicalize_sample
+from alpamayo2_edge.sample import canonicalize_sample, canonicalize_vqa_sample
 
 
-def _canonical_inputs(data: dict[str, Any], model_config: Any) -> dict[str, Any]:
-    history_steps = getattr(model_config, "history_num_steps", 20)
-    expected_tokens = (history_steps - 1) * 3
-    if model_config.tokens_per_history_traj != expected_tokens:
-        raise ValueError(f"{history_steps} history poses require {expected_tokens} history tokens")
+def _check_image_layout(model_config: Any) -> None:
     if (
         getattr(model_config, "frame_label", "relative_time") != "relative_time"
         or getattr(model_config, "token_layout", "camera_ts") != "camera_ts"
@@ -31,6 +31,14 @@ def _canonical_inputs(data: dict[str, Any], model_config: Any) -> dict[str, Any]
         raise ValueError(
             "Edge input preparation requires relative_time labels, camera_ts layout, and image encoding"
         )
+
+
+def _canonical_inputs(data: dict[str, Any], model_config: Any) -> dict[str, Any]:
+    history_steps = getattr(model_config, "history_num_steps", 20)
+    expected_tokens = (history_steps - 1) * 3
+    if model_config.tokens_per_history_traj != expected_tokens:
+        raise ValueError(f"{history_steps} history poses require {expected_tokens} history tokens")
+    _check_image_layout(model_config)
     return canonicalize_sample(data, history_num_steps=history_steps)
 
 
@@ -76,22 +84,10 @@ def _normalize_patches(patches: torch.Tensor, image_processor: Any) -> torch.Ten
     return result.reshape(-1, patch_dim)
 
 
-def prepare_model_inputs(data: dict[str, Any], model_config: Any, tokenizer: Any) -> dict[str, Any]:
-    """Pack one raw sample for ``sample_trajectories_from_data``.
-
-    Resizing occurs on uint8 before normalization, preserving the training path.
-    The returned history tensors include batch and trajectory-group dimensions:
-    ``[1, 1, 20, 3]`` for positions and ``[1, 1, 20, 3, 3]`` for rotations.
-    """
-    canonical = _canonical_inputs(data, model_config)
-    processor = get_processor(tokenizer, model_config)
-    messages = build_conversation(
-        canonical,
-        num_tokens_per_history_traj=model_config.tokens_per_history_traj,
-        include_camera_ids=model_config.include_camera_ids,
-        system_prompt=getattr(model_config, "system_prompt", None),
-    )
-    # Driving targets start with an empty think block, so the prompt closes it.
+def _tokenize_messages(
+    messages: list[dict[str, Any]], processor: Any, *, include_closed_thinking: bool
+) -> dict[str, Any]:
+    """Tokenize messages and normalize resized uint8 camera images."""
     text = processor.apply_chat_template(
         messages,
         tokenize=False,
@@ -101,7 +97,10 @@ def prepare_model_inputs(data: dict[str, Any], model_config: Any, tokenizer: Any
         enable_thinking=False,
     )
     if not text.endswith(CLOSED_THINKING):
-        raise ValueError(f"The chat template must end the driving prompt with {CLOSED_THINKING}")
+        raise ValueError(f"The chat template must end the generation prompt with {CLOSED_THINKING}")
+    if not include_closed_thinking:
+        # Remove only the assistant suffix. Keep the question text unchanged.
+        text = text[: -len(CLOSED_THINKING)]
     image_processor = processor.image_processor
     images = []
     for message in messages:
@@ -132,12 +131,54 @@ def prepare_model_inputs(data: dict[str, Any], model_config: Any, tokenizer: Any
         tokenized_data["pixel_values"], image_processor
     )
     if tokenized_data["input_ids"].shape[0] != 1:
-        raise ValueError("prepare_model_inputs expects one sample at a time")
+        raise ValueError("Edge input preparation expects one sample at a time")
+    return tokenized_data
+
+
+def prepare_model_inputs(data: dict[str, Any], model_config: Any, tokenizer: Any) -> dict[str, Any]:
+    """Pack one raw sample for ``sample_trajectories_from_data``.
+
+    Resizing occurs on uint8 before normalization, preserving the training path.
+    The returned history tensors include batch and trajectory-group dimensions:
+    ``[1, 1, 20, 3]`` for positions and ``[1, 1, 20, 3, 3]`` for rotations.
+    """
+    canonical = _canonical_inputs(data, model_config)
+    messages = build_conversation(
+        canonical,
+        num_tokens_per_history_traj=model_config.tokens_per_history_traj,
+        include_camera_ids=model_config.include_camera_ids,
+        system_prompt=getattr(model_config, "system_prompt", None),
+    )
+    tokenized_data = _tokenize_messages(
+        messages, get_processor(tokenizer, model_config), include_closed_thinking=True
+    )
     xyz, rot = canonical["ego_history_xyz"], canonical["ego_history_rot"]
     return {
         "tokenized_data": tokenized_data,
         "ego_history_xyz": xyz.unsqueeze(0) if xyz.ndim == 3 else xyz,
         "ego_history_rot": rot.unsqueeze(0) if rot.ndim == 4 else rot,
+    }
+
+
+def prepare_vqa_inputs(
+    data: dict[str, Any], model_config: Any, tokenizer: Any, question: str
+) -> dict[str, Any]:
+    """Pack six cameras with four frames each and a question for text generation.
+
+    Navigation and ego history are not required and do not enter the prompt.
+    The assistant prefix has no empty thinking block.
+    """
+    _check_image_layout(model_config)
+    messages = build_vqa_conversation(
+        canonicalize_vqa_sample(data),
+        question,
+        include_camera_ids=model_config.include_camera_ids,
+        system_prompt=getattr(model_config, "system_prompt", None),
+    )
+    return {
+        "tokenized_data": _tokenize_messages(
+            messages, get_processor(tokenizer, model_config), include_closed_thinking=False
+        )
     }
 
 
