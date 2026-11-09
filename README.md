@@ -3,11 +3,11 @@
 
 # Alpamayo 2 Edge
 
-Standalone PyTorch inference for the 2B-parameter Alpamayo 2 Edge checkpoint and its
-trajectory diffusion expert. The model is built on the Cosmos3-Edge vision-language
-backbone with a SigLIP2 vision encoder. Given six-camera observations, ego history,
-and a navigation instruction, it generates driving reasoning and 64 future poses at
-0.1-second intervals.
+Standalone PyTorch inference for the Alpamayo 2 Edge checkpoint, a 2.65B-parameter model
+that includes a trajectory diffusion expert. The model is built on the Cosmos3-Edge
+vision-language backbone with a SigLIP2 vision encoder. Given six-camera observations,
+ego history, and a navigation instruction, it generates driving reasoning and 64 future
+poses at 0.1-second intervals.
 
 Model access requires an authorized Hugging Face account. The weights are in
 [nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge); use the code at
@@ -200,7 +200,11 @@ sample = load_physical_aiavdataset(
     t0_us=4_000_000,
     nav_text="Turn right in 30m",
 )
-model, loading_info = load_model("nvidia/Alpamayo2-Edge", device="cuda")
+model, loading_info = load_model(
+    "nvidia/Alpamayo2-Edge",
+    revision="f8951d095de3589b3face1dec3f4394c8ecedb38",
+    device="cuda",
+)
 inputs = to_device(prepare_model_inputs(sample, model.config, model.tokenizer), device="cuda")
 torch.manual_seed(43)
 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
