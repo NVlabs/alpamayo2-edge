@@ -42,8 +42,9 @@ generates driving reasoning and 64 future poses at 0.1-second intervals.
 
 ## Prerequisites
 
-- A Linux host with an NVIDIA GPU, BF16 support, a compatible CUDA driver,
-  and enough GPU memory for inference.
+- A Linux host with an NVIDIA GPU, BF16 support, and a compatible CUDA driver.
+  We recommend **at least 16 GB of GPU memory** for the provided BF16 examples.
+  Larger inputs or more trajectory candidates can require more memory.
 - Python 3.12.
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) for environment management.
 - Access to
@@ -112,8 +113,8 @@ python -m alpamayo2_edge.inference \
 
 This downloads the model and loads camera images and ego history through the
 PhysicalAI-AV SDK. The [example manifest](examples/nav_samples.json) selects clip
-`ea7bbd31-b7a5-4972-8dbd-7089e6b53de4` at **4.0 seconds** with the navigation
-instruction **`Turn right in 30m`**.
+`ea7bbd31-b7a5-4972-8dbd-7089e6b53de4` at 4.0 seconds with the navigation
+instruction `Turn right in 30m`.
 
 For a local checkpoint and an explicitly selected clip:
 
@@ -171,9 +172,7 @@ This notebook example uses six cameras with four frames per camera, for 24 image
 Set `QUESTION` in the VQA section. Set `MAX_VQA_TOKENS` to limit the answer length.
 For example, ask how the ego vehicle should drive or which hazards are visible.
 The VLM generates text without trajectory diffusion. The prompt contains camera
-names, time labels, images, and the question. It omits navigation and ego history.
-The assistant prefix has no empty `<think></think>` suffix. The VQA figure shows
-all 24 input frames, the question, and the complete answer.
+names, time labels, images, and the question.
 
 ## Download the model for local use
 
@@ -321,10 +320,9 @@ used to rank candidates. The CLI checks trajectory shapes and finite values.
 
 ## Accelerated inference
 
-Opt-in BF16 speedups in `alpamayo2_edge.accel` keep the model and its sampling
-semantics and change only how the GPU executes them. The defaults are unchanged,
-and nothing is quantized. Install FlashAttention 2 first
-([details](docs/acceleration.md#requirements)), then add `--accel tuned`:
+You can opt-in basic speedups using `torch.compile`, CUDA graphs, FA2 and kernal auto-tuning.
+Install FlashAttention 2 first ([details](docs/acceleration.md#requirements)),
+then add `--accel tuned`:
 
 ```bash
 python -m alpamayo2_edge.inference \
@@ -361,7 +359,7 @@ Caveats:
   candidates are nearly tied.
 
 The [acceleration guide](docs/acceleration.md) covers requirements, the Python
-API and which calls are graphed.
+API and which calls are graphed. Further optimization please refer to [alpamayo-recipes](https://github.com/NVlabs/alpamayo-recipes).
 
 ## Tests
 
