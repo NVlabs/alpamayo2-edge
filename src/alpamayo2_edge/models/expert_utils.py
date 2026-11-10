@@ -96,7 +96,7 @@ def build_expert_pos_ids_and_attn_mask(
     device: torch.device,
     prefix_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build Qwen-VL position IDs and cache attention mask for expert denoising."""
+    """Build M-RoPE position IDs and cache attention mask for expert denoising."""
     position_ids = torch.arange(n_diffusion_tokens, device=device)
     position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
     position_ids += (rope_deltas + offset[:, None]).to(position_ids.device)

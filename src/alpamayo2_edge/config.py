@@ -70,7 +70,7 @@ def build_alpamayo2_edge_tokenizer(
 
 
 class Alpamayo2EdgeConfig(PretrainedConfig):
-    """Qwen3-VL backbone with the trained trajectory diffusion expert."""
+    """Cosmos3-Edge backbone with the trained trajectory diffusion expert."""
 
     model_type = "alpamayo2_edge"
 
@@ -81,7 +81,7 @@ class Alpamayo2EdgeConfig(PretrainedConfig):
         hist_traj_tokenizer_cfg: dict | None = None,
         future_traj_tokenizer_cfg: dict | None = None,
         vlm_name_or_path: str | None = None,
-        vlm_class: str = "Qwen3VLForConditionalGeneration",
+        vlm_class: str = "Cosmos3EdgeForConditionalGeneration",
         history_vocab_size: int = 1000,
         future_vocab_size: int = 3000,
         tokens_per_history_traj: int = 57,
@@ -129,7 +129,7 @@ class Alpamayo2EdgeConfig(PretrainedConfig):
             raise ValueError('Edge inference currently requires token_layout="camera_ts"')
         if getattr(self, "encode_as_video", False):
             raise ValueError("Edge inference expects image inputs, not encode_as_video")
-        if vlm_class != "Qwen3VLForConditionalGeneration":
+        if vlm_class != "Cosmos3EdgeForConditionalGeneration":
             raise ValueError(f"Unsupported Edge backbone: {vlm_class!r}")
         self.vlm_config = (
             AutoConfig.for_model(**vlm_config) if isinstance(vlm_config, dict) else vlm_config

@@ -48,10 +48,10 @@ def test_loading_incomplete_processor_assets_fails(tmp_path):
     "processor_config",
     [
         {},
-        {"processor_class": "Qwen3VLProcessor"},
+        {"processor_class": "Cosmos3EdgeProcessor"},
         {"image_processor": None},
         {"image_processor": {}},
-        {"image_processor": "Qwen2VLImageProcessor"},
+        {"image_processor": "Cosmos3EdgeImageProcessor"},
     ],
 )
 def test_unified_processor_without_image_configuration_is_incomplete(tmp_path, processor_config):
@@ -69,11 +69,11 @@ def test_trainer_checkpoint_loads_with_unified_processor_configuration(tmp_path,
     from tokenizers.models import WordLevel
     from transformers import (
         AutoProcessor,
+        Cosmos3EdgeConfig,
+        Cosmos3EdgeImageProcessor,
+        Cosmos3EdgeProcessor,
+        Cosmos3EdgeVideoProcessor,
         PreTrainedTokenizerFast,
-        Qwen2VLImageProcessor,
-        Qwen3VLConfig,
-        Qwen3VLProcessor,
-        Qwen3VLVideoProcessor,
         Trainer,
         TrainingArguments,
     )
@@ -103,10 +103,12 @@ def test_trainer_checkpoint_loads_with_unified_processor_configuration(tmp_path,
     )
     source = tmp_path / "tokenizer"
     tokenizer.save_pretrained(source)
-    processor = Qwen3VLProcessor(
+    processor = Cosmos3EdgeProcessor(
         tokenizer=tokenizer,
-        image_processor=Qwen2VLImageProcessor(size={"shortest_edge": 784, "longest_edge": 3136}),
-        video_processor=Qwen3VLVideoProcessor(),
+        image_processor=Cosmos3EdgeImageProcessor(
+            size={"shortest_edge": 784, "longest_edge": 3136}
+        ),
+        video_processor=Cosmos3EdgeVideoProcessor(),
         chat_template="{{ messages[0]['content'] }}",
     )
     config = Alpamayo2EdgeConfig(
@@ -115,7 +117,7 @@ def test_trainer_checkpoint_loads_with_unified_processor_configuration(tmp_path,
         enable_expert=False,
         history_vocab_size=1,
         future_vocab_size=1,
-        vlm_config=Qwen3VLConfig(
+        vlm_config=Cosmos3EdgeConfig(
             text_config={
                 "vocab_size": 16,
                 "hidden_size": 16,
@@ -124,17 +126,22 @@ def test_trainer_checkpoint_loads_with_unified_processor_configuration(tmp_path,
                 "num_attention_heads": 2,
                 "num_key_value_heads": 1,
                 "head_dim": 8,
+                "rope_parameters": {"rope_type": "default", "mrope_section": [2, 1, 1]},
                 "pad_token_id": 0,
                 "eos_token_id": 2,
             },
             vision_config={
-                "depth": 1,
+                "num_hidden_layers": 1,
                 "hidden_size": 16,
                 "intermediate_size": 32,
-                "num_heads": 2,
-                "out_hidden_size": 16,
-                "deepstack_visual_indexes": [],
+                "num_attention_heads": 2,
+                "num_patches": 4,
             },
+            projector_hidden_size=32,
+            image_token_id=5,
+            video_token_id=6,
+            vision_start_token_id=7,
+            vision_end_token_id=8,
         ),
     )
     model = Alpamayo2Edge(config)

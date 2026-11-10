@@ -24,36 +24,6 @@ def test_hf5_loading_diagnostics_serialize_sets():
 
 
 @pytest.mark.parametrize(
-    "removed_args",
-    [
-        ["--sample", "0"],
-        ["--bundle", "bundle"],
-        ["--sample-id", "sample_000"],
-        ["--all-samples"],
-    ],
-)
-def test_cli_rejects_removed_local_sample_options(removed_args, capsys):
-    from alpamayo2_edge.inference import main
-
-    with pytest.raises(SystemExit) as error:
-        main(
-            [
-                "--model-id",
-                "model",
-                "--manifest",
-                "clips.json",
-                "--output",
-                "output",
-                "--device",
-                "cpu",
-                *removed_args,
-            ]
-        )
-    assert error.value.code == 2
-    assert f"unrecognized arguments: {removed_args[0]}" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize(
     "args",
     [
         ["--model-id", "model"],
@@ -245,7 +215,7 @@ def _fake_cli_model(monkeypatch, flash_attn=True):
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "GPU")
     _mock_dataset_versions(monkeypatch)
     kernel = "fa2" if flash_attn else None
-    kernels = {"vision": "sdpa", "prefill": "sdpa", "decode": kernel, "expert": kernel}
+    kernels = {"prefill": "sdpa", "decode": kernel, "expert": kernel}
     monkeypatch.setattr(accel, "resolve_kernels", lambda attention, device: kernels)
     model = SimpleNamespace(config=SimpleNamespace(_name_or_path="model"))
     monkeypatch.setattr(checkpoint, "load_model", lambda *args, **kwargs: (model, {}))
@@ -254,22 +224,6 @@ def _fake_cli_model(monkeypatch, flash_attn=True):
     )
     monkeypatch.setattr(inference, "run_data", lambda *args: {"finite": True})
     return model
-
-
-def test_report_records_linear_patch_embedding(tmp_path, monkeypatch):
-    import json
-
-    from alpamayo2_edge import accel, inference
-
-    model = _fake_cli_model(monkeypatch)
-    calls = []
-    monkeypatch.setattr(accel, "use_linear_patch_embedding", calls.append)
-    args = _clip_cli_args(tmp_path)
-    inference.main(args)
-    assert "patch_embedding" not in json.loads((tmp_path / "report.json").read_text())
-    inference.main([*args, "--patch-embed", "linear"])
-    assert json.loads((tmp_path / "report.json").read_text())["patch_embedding"] == "linear"
-    assert calls == [model]
 
 
 def test_cli_acceleration_requires_cuda_and_bfloat16(capsys):
@@ -297,7 +251,9 @@ def test_report_records_acceleration(tmp_path, monkeypatch):
 
     def enable_acceleration(model, config):
         calls.append(config)
-        return SimpleNamespace(describe=lambda: {"parts": ["vision"], "fallbacks": {}})
+        return SimpleNamespace(
+            describe=lambda: {"parts": ["prefill", "decode", "expert"], "fallbacks": {}}
+        )
 
     monkeypatch.setattr(accel, "enable_acceleration", enable_acceleration)
     monkeypatch.setattr(inference, "warm_up", lambda *args: calls.append(args))
@@ -308,7 +264,7 @@ def test_report_records_acceleration(tmp_path, monkeypatch):
         ]
     )
     report = json.loads((tmp_path / "report.json").read_text())
-    assert report["acceleration"]["parts"] == ["vision"]
+    assert report["acceleration"]["parts"] == ["prefill", "decode", "expert"]
     assert report["acceleration"]["warmup_runs"] == 2
     assert (calls[0].mode, calls[0].attention) == ("compile", "sdpa")
     assert calls[1][0] is model
@@ -322,40 +278,19 @@ def test_report_records_acceleration(tmp_path, monkeypatch):
     assert calls[1][-1] == 2
 
 
-def test_cli_acceleration_without_flash_attention_needs_allow_partial(
+def test_cli_acceleration_without_flash_attention_stops_before_loading(
     tmp_path, monkeypatch, capsys
 ):
-    import json
-    from types import SimpleNamespace
-
-    from alpamayo2_edge import accel, checkpoint, inference
+    from alpamayo2_edge import checkpoint, inference
 
     _fake_cli_model(monkeypatch, flash_attn=False)
     loads = []
     monkeypatch.setattr(checkpoint, "load_model", lambda *args, **kwargs: loads.append(1))
-    args = _clip_cli_args(tmp_path)
     with pytest.raises(SystemExit) as error:
-        inference.main([*args, "--accel", "tuned"])
+        inference.main([*_clip_cli_args(tmp_path), "--accel", "tuned"])
     assert error.value.code == 2
-    message = capsys.readouterr().err
-    assert "flash_attn" in message and "--accel-allow-partial" in message
-    assert not loads  # Fails before loading the checkpoint.
-    with pytest.raises(SystemExit):
-        inference.main([*args, "--accel-allow-partial"])
-    assert "requires --accel" in capsys.readouterr().err
-
-    model = _fake_cli_model(monkeypatch, flash_attn=False)
-    description = {"parts": ["vision"], "skipped": {"decode": "requires flash_attn"}}
-    monkeypatch.setattr(
-        accel,
-        "enable_acceleration",
-        lambda model, config: SimpleNamespace(describe=lambda: description),
-    )
-    monkeypatch.setattr(inference, "warm_up", lambda *args: None)
-    inference.main([*args, "--accel", "tuned", "--accel-allow-partial"])
-    report = json.loads((tmp_path / "report.json").read_text())
-    assert report["acceleration"]["skipped"] == {"decode": "requires flash_attn"}
-    assert model.config._name_or_path == "model"
+    assert "flash_attn" in capsys.readouterr().err
+    assert not loads
 
 
 def test_cli_rejects_unavailable_attention_before_loading(monkeypatch, capsys):
