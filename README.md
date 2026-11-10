@@ -359,7 +359,8 @@ Caveats:
   candidates are nearly tied.
 
 The [acceleration guide](docs/acceleration.md) covers requirements, the Python
-API and which calls are graphed. Further optimization please refer to [alpamayo-recipes](https://github.com/NVlabs/alpamayo-recipes).
+API and which calls are graphed. For further acceleration and export to NVIDIA DRIVE AGX Thor,
+please see [alpamayo-recipes](https://github.com/NVlabs/alpamayo-recipes).
 
 ## Tests
 
