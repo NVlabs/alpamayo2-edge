@@ -23,12 +23,6 @@ generates driving reasoning and 64 future poses at 0.1-second intervals.
   <img src="./fig/alpamayo2edge_arch.webp" alt="NVIDIA Alpamayo 2 Edge architecture">
 </p>
 
-Model access requires an authorized Hugging Face account. The weights are in
-[nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge).
-Decoded positions follow the course, the rear axle's direction of
-travel, and decoded rotations estimate the body yaw, which differs from the path tangent
-by the rear-axle sideslip.
-
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
