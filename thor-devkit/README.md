@@ -12,7 +12,9 @@ FlashAttention 2); this project overrides those pins:
 | --- | --- | --- |
 | PyTorch / torchvision | 2.8.0 / 0.23.0 | 2.15.0+cu134 / 0.29.2+cu134 ([cu134 index](https://download.pytorch.org/whl/cu134)) |
 | KV-cache attention for `--accel` | FlashAttention 2 (`fa2`) | FlashAttention 4 (`flash-attn-4`, `fa4`) |
-| Extras | `dataset`, `notebook` optional | `dataset`, `notebook`, FlashInfer 0.7.3 (sm110a) |
+| `flash` extra | `flash-attn==2.8.3` | `flash-attn-4[cu13]==4.0.0b38` |
+| `dataset`, `notebook` extras | Same packages | Same packages |
+| Always installed | | FlashInfer 0.7.3 (sm110a) |
 
 The lock resolves only for `linux`/`aarch64`, and `alpamayo2-edge` is installed in
 editable mode from `..`, so source changes in the repository apply directly.
@@ -25,9 +27,14 @@ From the repository root:
 
 ```bash
 export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
-uv sync --locked --project thor-devkit
+uv sync --locked --project thor-devkit --all-extras
 source .venv/bin/activate
 ```
+
+`--all-extras` installs `flash`, `dataset` and `notebook`, which together match the
+validated environment. Select a subset with `--extra`, for example
+`--extra flash --extra dataset` without Jupyter. `uv sync` removes packages from
+extras that are not selected, and without `flash`, `--accel` is unavailable.
 
 Use an absolute `UV_PROJECT_ENVIRONMENT`; a relative path resolves against
 `thor-devkit/`. Do not add `thor-devkit` to a `[tool.uv.workspace]` in the root

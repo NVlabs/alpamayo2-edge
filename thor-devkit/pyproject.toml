@@ -9,10 +9,9 @@ version = "0.1.0"
 description = "Alpamayo 2 Edge environment for the NVIDIA Jetson AGX Thor Developer Kit"
 requires-python = "==3.12.*"
 dependencies = [
-  "alpamayo2-edge[dataset,notebook]",
+  "alpamayo2-edge",
   "torch==2.15.0+cu134",
   "torchvision==0.29.2+cu134",
-  "flash-attn-4[cu13]==4.0.0b38",
   "flashinfer-python==0.7.3",
   "flashinfer-cubin==0.7.3",
   "flashinfer-jit-cache-sm110a==0.7.3+cu134",
@@ -20,6 +19,13 @@ dependencies = [
   "truststore",
   "wheel",
 ]
+
+[project.optional-dependencies]
+# The root project's extras, with FlashAttention 4 (sm_110) in place of FlashAttention 2.
+# [cu13] pulls nvidia-cutlass-dsl's CUDA 13 libraries.
+flash = ["flash-attn-4[cu13]==4.0.0b38"]
+dataset = ["physical-ai-av==0.2.0"]
+notebook = ["physical-ai-av==0.2.0", "jupyter>=1.1.1", "matplotlib>=3.10"]
 
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.9"]

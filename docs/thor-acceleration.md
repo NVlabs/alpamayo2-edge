@@ -22,11 +22,11 @@ Install the locked Thor environment from the repository root, as described in
 
 ```bash
 export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
-uv sync --locked --project thor-devkit
+uv sync --locked --project thor-devkit --all-extras
 source .venv/bin/activate
 ```
 
-It provides `flash-attn-4[cu13]==4.0.0b38`, which installs only
+Its `flash` extra provides `flash-attn-4[cu13]==4.0.0b38`, which installs only
 `flash_attn.cute`. FlashAttention 2 has no sm_110 build. Do not install it next to
 FlashAttention 4: when both are importable, FlashAttention 2 is selected.
 
