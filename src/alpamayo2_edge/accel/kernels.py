@@ -4,7 +4,9 @@
 """Attention kernels used inside the accelerated graphs, and their selection.
 
 Decode and expert steps attend a static flash-layout KV cache through
-``flash_attn_with_kvcache`` from FlashAttention 2. The prompt prefill uses PyTorch
+``flash_attn_with_kvcache`` from FlashAttention 2 or, when only FlashAttention 4
+(``flash_attn.cute``, e.g. on Blackwell/Thor) is installed, through FA4's
+``flash_attn_varlen_func`` after an in-place cache write. The prompt prefill uses PyTorch
 SDPA or, on Hopper with FlashAttention 3 installed, FA3. Both kernels are custom
 ops, so ``torch.compile`` keeps each as one opaque kernel. CPU tensors use a
 PyTorch reference implementation, which keeps the control flow testable without
@@ -49,6 +51,24 @@ def _kvcache_attention_reference(q, k_cache, v_cache, k, v, cache_seqlens, softm
     return out
 
 
+def _kvcache_attention_fa4(q, k_cache, v_cache, k, v, cache_seqlens, softmax_scale, causal):
+    # FA4 has no fused cache append: write the new tokens with graph-safe indexing first.
+    new_tokens = k.shape[1]
+    rows = torch.arange(q.shape[0], device=q.device)[:, None]
+    columns = cache_seqlens.long()[:, None] + torch.arange(new_tokens, device=q.device)
+    k_cache[rows, columns] = k
+    v_cache[rows, columns] = v
+    out = _flash_function("flash_attn.cute", "flash_attn_varlen_func")(
+        q,
+        k_cache,
+        v_cache,
+        seqused_k=cache_seqlens + new_tokens,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
 @torch.library.custom_op("alpamayo2_edge::kvcache_attention", mutates_args=("k_cache", "v_cache"))
 def kvcache_attention(
     q: torch.Tensor,
@@ -71,6 +91,11 @@ def kvcache_attention(
         return _kvcache_attention_reference(
             q, k_cache, v_cache, k, v, cache_seqlens, softmax_scale, causal
         )
+    if _kvcache_kernel() == "fa4":
+        out = _kvcache_attention_fa4(
+            q, k_cache, v_cache, k, v, cache_seqlens, softmax_scale, causal
+        )
+        return out.contiguous()
     out = _flash_function("flash_attn", "flash_attn_with_kvcache")(
         q,
         k_cache,
@@ -125,13 +150,29 @@ def _importable(module_name: str) -> bool:
     return True
 
 
+def _select_kvcache_kernel() -> str | None:
+    # FA4 wheels install a ``flash_attn`` namespace holding only ``flash_attn.cute``, so
+    # FA2 is detected by its interface module rather than by ``flash_attn`` itself.
+    if _importable("flash_attn.flash_attn_interface"):
+        return "fa2"
+    if _importable("flash_attn.cute"):
+        return "fa4"
+    return None
+
+
+@functools.cache
+def _kvcache_kernel() -> str | None:
+    return _select_kvcache_kernel()
+
+
 def resolve_kernels(attention: str, device: torch.device | str) -> dict[str, str | None]:
     """Choose the attention kernel of each accelerated part.
 
     ``prefill`` uses ``"fa3"`` or ``"sdpa"``. ``"auto"`` picks FA3 only on
     Hopper (compute capability 9.0) with ``flash_attn_interface`` importable.
-    ``decode`` and ``expert`` use ``"fa2"`` when ``flash_attn`` is importable, otherwise
-    ``None`` (those parts stay eager). FA2 is kept for one-token decode on Hopper too,
+    ``decode`` and ``expert`` use ``"fa2"`` when FlashAttention 2 is importable, else
+    ``"fa4"`` when FlashAttention 4 (``flash_attn.cute``) is, otherwise ``None``
+    (those parts stay eager). FA2 is kept for one-token decode on Hopper too,
     where it is faster than FA3. CPU devices use the PyTorch ``"reference"`` kernels.
     """
     if attention not in ATTENTION_CHOICES:
@@ -148,5 +189,5 @@ def resolve_kernels(attention: str, device: torch.device | str) -> dict[str, str
             "attention='fa3' requires a Hopper (sm_90) GPU and an importable flash_attn_interface"
         )
     dense = "fa3" if attention == "fa3" or (attention == "auto" and fa3) else "sdpa"
-    kvcache = "fa2" if _importable("flash_attn") else None
+    kvcache = _select_kvcache_kernel()
     return {"prefill": dense, "decode": kvcache, "expert": kvcache}

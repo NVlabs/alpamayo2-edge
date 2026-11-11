@@ -174,15 +174,21 @@ def test_kernel_selection_per_gpu(monkeypatch):
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
         monkeypatch.setattr(kernels_module, "_importable", lambda name: name in importable)
 
-    fake((9, 0), {"flash_attn", "flash_attn_interface"})
+    FA2 = "flash_attn.flash_attn_interface"
+    fake((9, 0), {FA2, "flash_attn_interface"})
     assert resolve_kernels("auto", "cuda") == {"prefill": "fa3", "decode": "fa2", "expert": "fa2"}
     assert resolve_kernels("sdpa", "cuda")["prefill"] == "sdpa"
-    fake((9, 0), {"flash_attn"})
+    fake((9, 0), {FA2})
     assert resolve_kernels("auto", "cuda")["prefill"] == "sdpa"
     with pytest.raises(ValueError, match="Hopper"):
         resolve_kernels("fa3", "cuda")
-    fake((12, 1), {"flash_attn", "flash_attn_interface"})
+    fake((12, 1), {FA2, "flash_attn_interface"})
     assert resolve_kernels("auto", "cuda") == {"prefill": "sdpa", "decode": "fa2", "expert": "fa2"}
+    # An FA4-only install exposes ``flash_attn.cute`` but no FA2 interface.
+    fake((11, 0), {"flash_attn", "flash_attn.cute"})
+    assert resolve_kernels("auto", "cuda") == {"prefill": "sdpa", "decode": "fa4", "expert": "fa4"}
+    fake((11, 0), {"flash_attn"})
+    assert resolve_kernels("auto", "cuda")["decode"] is None
     fake((8, 0), set())
     assert resolve_kernels("auto", "cuda")["decode"] is None
     assert resolve_kernels("auto", "cpu")["decode"] == "reference"
@@ -443,7 +449,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 
 def _gpu_model(monkeypatch):
     if resolve_kernels("sdpa", "cuda")["decode"] is None:
-        pytest.skip("requires an importable flash_attn (FlashAttention 2)")
+        pytest.skip("requires an importable flash_attn (FlashAttention 2 or 4)")
     return _tiny_model(monkeypatch, dtype="bfloat16").to(device="cuda", dtype=torch.bfloat16)
 
 
