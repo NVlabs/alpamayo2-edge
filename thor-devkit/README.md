@@ -62,3 +62,15 @@ compiling and capturing graphs. FlashAttention 4 prints `aux_data ... cannot be
 converted to a JitArgument` warnings from the CuTe DSL; they are harmless. See
 [docs/thor-acceleration.md](../docs/thor-acceleration.md) for Thor-specific
 acceleration details.
+
+## Jetson AGX Orin
+
+The same environment also installs and runs on the Jetson AGX Orin 32GB Developer
+Kit (aarch64, sm_87) with JetPack 7.2.1 and its CUDA 13.2 driver. The setup and run
+commands above apply unchanged. With `--accel tuned`, all three parts are graphed
+with `"decode": "fa4"` and `"expert": "fa4"` and no fallbacks; FlashAttention 4 uses
+its Ampere (sm_8x) kernels there. FlashInfer's sm110a JIT cache is installed but not
+used on Orin. The first graph build takes a few minutes with an empty compiler
+cache; see [Compilation and
+warm-up](../docs/thor-acceleration.md#compilation-and-warm-up) for keeping the cache
+between runs.

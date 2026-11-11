@@ -112,6 +112,16 @@ These do not affect results:
 - `TRITON_DEFAULT_FP_FUSION is unset` comes from Triton 3.9; see
   [Usage](#usage).
 
+## Jetson AGX Orin
+
+The `thor-devkit` environment also runs on the Jetson AGX Orin 32GB Developer Kit
+(sm_87) with JetPack 7.2.1 and its CUDA 13.2 driver, using the same commands.
+`--accel tuned` graphs the prefill, decode and expert with `fa4` for decode and
+expert attention and no fallbacks; FlashAttention 4 selects its Ampere (sm_8x)
+kernels. As on Thor, the cu134 PyTorch wheels run on the 13.2 driver through CUDA
+minor-version compatibility, without `cuda-compat`. The GPU tests in
+`tests/test_accel.py` pass there as well.
+
 ## Tests
 
 ```bash
