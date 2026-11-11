@@ -52,4 +52,6 @@ TRITON_DEFAULT_FP_FUSION=1 python -m alpamayo2_edge.inference \
 `report.json` lists `"decode": "fa4"` and `"expert": "fa4"` under
 `acceleration.kernels`. The first `--accel tuned` run spends about a minute
 compiling and capturing graphs. FlashAttention 4 prints `aux_data ... cannot be
-converted to a JitArgument` warnings from the CuTe DSL; they are harmless.
+converted to a JitArgument` warnings from the CuTe DSL; they are harmless. See
+[docs/thor-acceleration.md](../docs/thor-acceleration.md) for Thor-specific
+acceleration details.

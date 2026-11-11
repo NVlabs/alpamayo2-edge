@@ -37,7 +37,8 @@ always run eagerly.
   FlashAttention 4 (`flash-attn-4`, imported as `flash_attn.cute`) replaces
   FlashAttention 2 for the decode and expert graphs; `report.json` then lists
   their kernel as `fa4`. FlashAttention 2 is preferred when both are installed.
-  The [`thor-devkit/`](../thor-devkit/README.md) project locks such an environment.
+  The [`thor-devkit/`](../thor-devkit/README.md) project locks such an environment;
+  see [thor-acceleration.md](thor-acceleration.md).
 - Without an importable FlashAttention 2 or 4, nothing is accelerated: the prefill and
   expert graphs use the decode part's static KV cache. `--accel` then stops with
   an error before loading the model. In Python, `enable_acceleration` emits a
