@@ -51,7 +51,8 @@ generates driving reasoning and 64 future poses at 0.1-second intervals.
   [Alpamayo 2 Edge](https://huggingface.co/nvidia/Alpamayo2-Edge) and
   [PhysicalAI-Autonomous-Vehicles](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles)
   on Hugging Face.
-- For accelerated inference: FlashAttention 2. See the
+- For accelerated inference: FlashAttention 2 (or FlashAttention 4 on Blackwell-class
+  GPUs such as Jetson AGX Thor). See the
   [acceleration requirements](docs/acceleration.md#requirements).
 
 ## Setup
@@ -66,6 +67,9 @@ source .venv/bin/activate
 ```
 
 `UV_PROJECT_ENVIRONMENT` selects the environment used by the commands below.
+On an NVIDIA Jetson AGX Thor Developer Kit, use the separately locked
+[`thor-devkit/`](thor-devkit/README.md) environment instead (PyTorch 2.15 / CUDA 13.4,
+FlashAttention 4).
 Check the CLI and CUDA environment before loading the model:
 
 ```bash

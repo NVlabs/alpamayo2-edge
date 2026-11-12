@@ -52,7 +52,8 @@ class AccelConfig:
     ``max-autotune-no-cudagraphs`` mode, and ``"compile"`` uses the default mode
     everywhere. ``attention`` selects the prefill kernel: ``"auto"`` uses
     FlashAttention 3 on Hopper when it is installed, and PyTorch SDPA otherwise.
-    Decode and expert attention always use FlashAttention 2 ``flash_attn_with_kvcache``.
+    Decode and expert attention use FlashAttention 2 ``flash_attn_with_kvcache``, or
+    FlashAttention 4 (``flash_attn.cute``) when FA2 is not installed.
     Shapes are bucketed to ``kv_bucket`` tokens. ``warmup`` eager runs precede each
     CUDA-graph capture. ``compile=False`` and ``cuda_graphs=False`` run the same code
     eagerly, for debugging and CPU tests.
@@ -153,7 +154,7 @@ def enable_acceleration(model: torch.nn.Module, config: AccelConfig | None = Non
     skipped: dict[str, str] = {}
     for part in ("decode", "expert"):
         if part in requested and kernels[part] is None:
-            skipped[part] = "requires flash_attn (FlashAttention 2)"
+            skipped[part] = "requires flash_attn (FlashAttention 2 or 4)"
     # Prefill writes, and the expert reads, the decode part's flash KV cache.
     has_decode = "decode" in requested and "decode" not in skipped
     for part in ("prefill", "expert"):

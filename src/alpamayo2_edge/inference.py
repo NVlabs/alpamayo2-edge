@@ -271,7 +271,7 @@ def main(argv=None) -> None:
             parser.error(str(exc))
         if kernels["decode"] is None:
             parser.error(
-                "--accel needs an importable flash_attn (FlashAttention 2) for the prefill, "
+                "--accel needs an importable flash_attn (FlashAttention 2 or 4) for the prefill, "
                 "decode and expert graphs; install it (see docs/acceleration.md#requirements)."
             )
     settings = dict(
@@ -339,7 +339,7 @@ def main(argv=None) -> None:
         report["acceleration"] = {
             **acceleration.describe(),
             "warmup_runs": args.accel_warmup,
-            "flash_attn": _package_version("flash-attn"),
+            "flash_attn": _package_version("flash-attn") or _package_version("flash-attn-4"),
         }
     from importlib.metadata import version
 

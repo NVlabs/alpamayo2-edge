@@ -33,14 +33,20 @@ always run eagerly.
   packages that are not in `uv.lock`, including this wheel: add `--inexact` to
   later syncs (for example `uv sync --locked --inexact --extra dataset --dev`),
   or reinstall the wheel afterwards.
-- Without an importable `flash_attn`, nothing is accelerated: the prefill and
+- On Blackwell-class GPUs such as the Jetson AGX Thor Developer Kit (sm_110),
+  FlashAttention 4 (`flash-attn-4`, imported as `flash_attn.cute`) replaces
+  FlashAttention 2 for the decode and expert graphs; `report.json` then lists
+  their kernel as `fa4`. FlashAttention 2 is preferred when both are installed.
+  The [`thor-devkit/`](../thor-devkit/README.md) project locks such an environment;
+  see [thor-acceleration.md](thor-acceleration.md).
+- Without an importable FlashAttention 2 or 4, nothing is accelerated: the prefill and
   expert graphs use the decode part's static KV cache. `--accel` then stops with
   an error before loading the model. In Python, `enable_acceleration` emits a
   `RuntimeWarning`, and `handle.skipped` lists the parts that stay eager and why.
 - FlashAttention 3 is optional and Hopper-only (`flash_attn_interface`, built
   from the FlashAttention `hopper/` directory). With `--accel-attention auto` it
   is used for the prompt prefill on sm_90 when importable. Decode and expert
-  attention keep FlashAttention 2.
+  attention keep FlashAttention 2 (or 4).
 
 ## Usage
 
