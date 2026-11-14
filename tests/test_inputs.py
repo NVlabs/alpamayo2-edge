@@ -184,6 +184,29 @@ class _TemplateOnlyProcessor:
         raise StopIteration
 
 
+def test_processor_is_read_once_per_checkpoint(monkeypatch):
+    loads = []
+
+    def from_pretrained(checkpoint, **kwargs):
+        loads.append(checkpoint)
+        return SimpleNamespace(checkpoint=checkpoint, tokenizer=None)
+
+    monkeypatch.setattr(helper.AutoProcessor, "from_pretrained", from_pretrained)
+    helper._load_processor.cache_clear()
+    try:
+        edge = SimpleNamespace(_name_or_path="/checkpoints/edge")
+        first = helper.get_processor("tokenizer-a", edge)
+        second = helper.get_processor("tokenizer-b", edge)
+        elsewhere = SimpleNamespace(_name_or_path="/checkpoints/other")
+        other = helper.get_processor("tokenizer-a", elsewhere)
+    finally:
+        helper._load_processor.cache_clear()
+    assert loads == ["/checkpoints/edge", "/checkpoints/other"]
+    assert first is not second
+    assert (first.tokenizer, second.tokenizer) == ("tokenizer-a", "tokenizer-b")
+    assert (first.checkpoint, other.checkpoint) == ("/checkpoints/edge", "/checkpoints/other")
+
+
 @pytest.mark.parametrize("closed", [True, False])
 def test_driving_prompt_disables_thinking(monkeypatch, closed):
     processor = _TemplateOnlyProcessor(closed)
