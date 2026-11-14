@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import copy
+import functools
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -52,12 +54,21 @@ def create_messages(data: dict[str, Any], model_config: Any) -> list[dict[str, A
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _load_processor(checkpoint: str) -> Any:
+    return AutoProcessor.from_pretrained(checkpoint, fix_mistral_regex=True)
+
+
 def get_processor(tokenizer: Any, model_config: Any) -> Any:
-    """Read processor settings and the chat template from the model checkpoint."""
+    """Read processor settings and the chat template from the model checkpoint.
+
+    The processor files are read once per checkpoint. Each call returns its own
+    shallow copy, so one caller's tokenizer does not replace another's.
+    """
     checkpoint = resolve_checkpoint_name_or_path(model_config)
     if checkpoint is None:
         raise ValueError("model_config must include a checkpoint path or vlm_name_or_path")
-    processor = AutoProcessor.from_pretrained(checkpoint, fix_mistral_regex=True)
+    processor = copy.copy(_load_processor(str(checkpoint)))
     processor.tokenizer = tokenizer
     return processor
 
