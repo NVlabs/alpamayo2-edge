@@ -402,3 +402,22 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, checks, and pull r
 Source code as provided in this repository: Apache License 2.0 - see [LICENSE](LICENSE) for details.
 
 Model weights on Huggingface [nvidia/Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge) are released under the [OpenMDW-1.1](https://openmdw.ai/license/1-1/) license.
+
+## Other platforms (ROCm)
+
+Verified on AMD Radeon 8060S (gfx1151, Strix Halo) with TheRock ROCm PyTorch
+wheels — the model runs, with two caveats:
+
+- **MAGMA**: `torch.linalg.cholesky` / `torch.cholesky_solve` (used by
+  `action_space/utils.py` for the trajectory solve) need a MAGMA-enabled torch
+  build; on wheels without MAGMA they raise at runtime. The affected matrices
+  are ≤ 65×65, so running these two calls on CPU is a safe workaround.
+- **FlashAttention**: SDPA falls back to the math backend on AMD GPUs. Set
+  `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` to enable AOTriton
+  FlashAttention — 2× lower end-to-end latency in our tests (5.06 s → 2.50 s,
+  10 diffusion steps).
+- **Python**: also verified on Python 3.13 (runtime deps are pure Python),
+  although `requires-python` currently caps at `<3.13`.
+
+Latency figures are from a single machine (Ryzen AI Max+ 395 / ROCm 7.13),
+not a general benchmark.
