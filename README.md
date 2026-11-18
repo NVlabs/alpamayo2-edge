@@ -361,6 +361,8 @@ Caveats:
 The [acceleration guide](docs/acceleration.md) covers requirements, the Python
 API and which calls are graphed. For further acceleration and export to NVIDIA DRIVE AGX Thor,
 please see [alpamayo-recipes](https://github.com/NVlabs/alpamayo-recipes).
+To run the model with ExecuTorch and TensorRT engines, see
+[examples/executorch_tensorrt](examples/executorch_tensorrt/README.md).
 
 ## Tests
 
