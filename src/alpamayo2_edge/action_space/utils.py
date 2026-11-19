@@ -22,6 +22,34 @@ from alpamayo2_edge.geometry.rotation import round_2pi_torch
 logger = logging.RankedLogger(__name__, rank_zero_only=False)
 logger.setLevel("INFO")
 
+# solve_xs_eq_y retries with a growing ridge while the normal equations are not positive
+# definite. The cap keeps a system that can never be factorized (NaNs, a backend that
+# refuses to factor at all) from looping forever instead of failing.
+_MAX_RIDGE_ATTEMPTS = 10
+
+
+def _cholesky_solve_or_cpu(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Solve ``lhs @ x = rhs`` for a symmetric positive-definite ``lhs``.
+
+    ``rhs`` already carries the solver dimension, i.e. it has shape ``(..., M, K)``.
+
+    Some ROCm PyTorch wheels are built without MAGMA, which makes ``torch.linalg.cholesky``
+    and ``torch.cholesky_solve`` raise ``RuntimeError`` on CUDA tensors even when ``lhs`` is
+    perfectly well conditioned. The systems solved here are tiny (at most 65x65), so a CPU
+    round trip is negligible: retry factorization and solve on CPU before giving up. A
+    genuinely non positive-definite input raises :class:`torch.linalg.LinAlgError` on either
+    device and is passed through unchanged, so callers can regularize and retry.
+    """
+    try:
+        return torch.cholesky_solve(rhs, torch.linalg.cholesky(lhs))
+    except torch.linalg.LinAlgError:
+        raise
+    except RuntimeError as err:
+        logger.warning(f"Cholesky solve failed on {lhs.device} ({err}); retrying on CPU")
+        # A LinAlgError raised here propagates as-is: on CPU the input really is singular.
+        solved = torch.cholesky_solve(rhs.cpu(), torch.linalg.cholesky(lhs.cpu()))
+        return solved.to(device=rhs.device, dtype=rhs.dtype)
+
 
 def unwrap_angle(phi: torch.Tensor) -> torch.Tensor:
     """Unwrap the last dimension of the tensor to make sure the diff is in (-pi, pi]."""
@@ -228,8 +256,7 @@ def solve_single_constraint(
     # strip off the x_init term
     lhs = ATA + DTD[..., 1:, 1:] + ridge_term
 
-    L = torch.linalg.cholesky(lhs)
-    x = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)  # (..., N)
+    x = _cholesky_solve_or_cpu(lhs, rhs.unsqueeze(-1)).squeeze(-1)  # (..., N)
 
     x = torch.cat([x_init.unsqueeze(-1), x], dim=-1)  # (..., N+1)
     return x
@@ -295,22 +322,30 @@ def solve_xs_eq_y(
     )
 
     # NOTE: Since there is no terminal constraint, we need to handle the singularity case by
-    # increasing the ridge term.
-    L = None
-    while L is None:
+    # increasing the ridge term. A ridge of 0 never grows (0 * 10 == 0), so seed it with a small
+    # positive value on the first retry, and cap the retries so a system that can never be
+    # factorized raises instead of looping forever.
+    solved = None
+    for _ in range(_MAX_RIDGE_ATTEMPTS):
         try:
             ridge_term = ridge * torch.eye(N, dtype=dtype, device=device).expand(*lead, N, N)
             lhs = ATA + DTD + ridge_term
             # Ensure dtype consistency for torch.compile fake tensor meta pass
             if rhs.dtype != lhs.dtype:
                 rhs = rhs.to(lhs.dtype)
-            L = torch.linalg.cholesky(lhs)
-        except RuntimeError as e:
+            solved = _cholesky_solve_or_cpu(lhs, rhs.unsqueeze(-1)).squeeze(-1)
+            break
+        except torch.linalg.LinAlgError as e:
             logger.error(f"Error in cholesky decomposition: {e}", exc_info=True)
-            ridge *= 10
+            ridge = max(ridge * 10, 1e-6)
             logger.warning(f"Resolving singularity using ridge {ridge}")
 
-    return torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)  # (..., N)
+    if solved is None:
+        raise torch.linalg.LinAlgError(
+            f"Failed to factorize the normal equations after {_MAX_RIDGE_ATTEMPTS} ridge "
+            f"retries (last ridge={ridge})."
+        )
+    return solved  # (..., N)
 
 
 @torch.no_grad()
@@ -393,8 +428,7 @@ def dxy_theta_to_v_without_v0(
     # strip off the x_init term
     lhs = ATA + DTD + ridge_term
 
-    L = torch.linalg.cholesky(lhs)
-    y = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)  # (..., N+1)
+    y = _cholesky_solve_or_cpu(lhs, rhs.unsqueeze(-1)).squeeze(-1)  # (..., N+1)
 
     return y  # (..., N+1)
 
@@ -479,8 +513,7 @@ def dxy_theta_to_v(
     # strip off the x_init term
     lhs = ATA[..., 1:, 1:] + DTD[..., 1:, 1:] + ridge_term
 
-    L = torch.linalg.cholesky(lhs)
-    y = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)  # (..., N)
+    y = _cholesky_solve_or_cpu(lhs, rhs.unsqueeze(-1)).squeeze(-1)  # (..., N)
 
     return torch.cat([v0.unsqueeze(-1), y], dim=-1)  # (..., N+1)
 
